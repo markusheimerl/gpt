@@ -22,7 +22,7 @@ GPT* init_gpt(int seq_len, int d_model, int hidden_dim, int num_layers, int batc
     
     size_t token_emb_size = gpt->vocab_size * d_model;
     size_t embedded_size = batch_size * seq_len * d_model;
-    size_t output_size = batch_size * seq_len * gpt->vocab_size;
+    size_t output_size = (size_t)batch_size * seq_len * gpt->vocab_size;
     
     // Allocate host memory for weight initialization
     half* h_token_embedding = (half*)malloc(token_emb_size * sizeof(half));
@@ -214,7 +214,7 @@ __global__ static void softmax_cross_entropy_kernel(float* loss_result, half* gr
     
     if (b >= batch_size || t >= seq_len) return;
     
-    int logits_offset = b * seq_len * vocab_size + t * vocab_size;
+    size_t logits_offset = (size_t)b * seq_len * vocab_size + t * vocab_size;
     half* logits_bt = &logits[logits_offset];
     half* grad_logits_bt = &grad_logits[logits_offset];
     
