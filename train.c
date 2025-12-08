@@ -133,7 +133,7 @@ int main(int argc, char* argv[]) {
             backward_pass_gpt(gpt, &input_tokens[batch * batch_size * seq_len]);
             
             // Update weights with cosine learning rate schedule
-            float lr = learning_rate * fminf(1.0f, (float)(chunk_idx * (sequences_per_chunk / batch_size) + batch) / 1000.0f) * (0.5f * (1.0f + cosf(M_PI * ((float)(chunk_idx * (sequences_per_chunk / batch_size) + batch) / (float)(total_sequences / batch_size)))));
+            float lr = learning_rate * fminf(1.0f, (float)(chunk_idx * (sequences_per_chunk / batch_size) + batch) / 1000.0f) * (0.1f + 0.45f * (1.0f + cosf(M_PI * ((float)(chunk_idx * (sequences_per_chunk / batch_size) + batch) / (float)(total_sequences / batch_size)))));
             update_weights_gpt(gpt, lr, batch_size);
             
             struct timespec end; clock_gettime(CLOCK_MONOTONIC, &end);
