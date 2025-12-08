@@ -106,7 +106,7 @@ int main(int argc, char* argv[]) {
     const int num_layers = 21;
     const int batch_size = 22;
     const int d_model = num_layers * 64;
-    const int hidden_dim = d_model * 4;
+    const int hidden_dim = (d_model * 8) / 3;
     const float learning_rate = 0.0001f;
     
     // Initialize or load model
@@ -116,7 +116,9 @@ int main(int argc, char* argv[]) {
         gpt = init_gpt(seq_len, d_model, hidden_dim, num_layers, batch_size, cublaslt_handle);
     }
     
-    printf("Parameters: ~%.1fM\n", (float)(gpt->vocab_size * d_model + num_layers * ((size_t)4 * d_model * d_model + d_model * hidden_dim + hidden_dim * d_model)) / 1e6f);
+    size_t attention_params = 4 * (size_t)d_model * d_model;
+    size_t mlp_params = 2 * (size_t)d_model * hidden_dim + hidden_dim * d_model;
+    printf("Parameters: ~%.1fM\n", (float)(gpt->vocab_size * d_model + num_layers * (attention_params + mlp_params)) / 1e6f);
     
     // Create shuffled indices for random sampling without replacement
     size_t total_sequences = (get_file_size("../corpus.txt") - 2) / (2 * seq_len);
