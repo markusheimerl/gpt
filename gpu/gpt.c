@@ -209,6 +209,8 @@ __global__ static void token_embedding_grad_kernel(half* token_embedding_grad, h
 
 // CUDA kernel for softmax and cross-entropy loss computation
 __global__ static void softmax_cross_entropy_kernel(float* loss_result, half* grad_logits, half* logits, unsigned short* targets, int batch_size, int seq_len, int vocab_size) {
+    extern __shared__ float smem[];
+    
     int b = blockIdx.x;
     int t = blockIdx.y;
     
@@ -218,35 +220,58 @@ __global__ static void softmax_cross_entropy_kernel(float* loss_result, half* gr
     half* logits_bt = &logits[logits_offset];
     half* grad_logits_bt = &grad_logits[logits_offset];
     
+    int tid = threadIdx.x, nthreads = blockDim.x;
+    int warp_id = tid >> 5, lane_id = tid & 31, nwarps = nthreads >> 5;
+    
     // Find max for numerical stability
-    float max_logit = -1e30f;
-    for (int v = 0; v < vocab_size; v++) {
-        float val = __half2float(logits_bt[v]);
-        if (val > max_logit) max_logit = val;
+    float val = -1e30f;
+    for (int v = tid; v < vocab_size; v += nthreads) {
+        val = fmaxf(val, __half2float(logits_bt[v]));
     }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) val = fmaxf(val, __shfl_xor_sync(0xffffffff, val, offset));
+    if (lane_id == 0) smem[warp_id] = val;
+    __syncthreads();
+    if (warp_id == 0) {
+        val = (lane_id < nwarps) ? smem[lane_id] : -1e30f;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) val = fmaxf(val, __shfl_xor_sync(0xffffffff, val, offset));
+        if (lane_id == 0) smem[0] = val;
+    }
+    __syncthreads();
+    float max_val = smem[0];
     
-    // Compute softmax probabilities
-    float sum_exp = 0.0f;
-    for (int v = 0; v < vocab_size; v++) {
-        float exp_val = expf(__half2float(logits_bt[v]) - max_logit);
+    // Compute exp and sum
+    val = 0.0f;
+    for (int v = tid; v < vocab_size; v += nthreads) {
+        float exp_val = expf(__half2float(logits_bt[v]) - max_val);
         grad_logits_bt[v] = __float2half(exp_val);
-        sum_exp += exp_val;
+        val += exp_val;
     }
-    
-    // Normalize to get probabilities
-    for (int v = 0; v < vocab_size; v++) {
-        grad_logits_bt[v] = __float2half(__half2float(grad_logits_bt[v]) / sum_exp);
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) val += __shfl_xor_sync(0xffffffff, val, offset);
+    if (lane_id == 0) smem[warp_id] = val;
+    __syncthreads();
+    if (warp_id == 0) {
+        val = (lane_id < nwarps) ? smem[lane_id] : 0.0f;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) val += __shfl_xor_sync(0xffffffff, val, offset);
+        if (lane_id == 0) smem[0] = val;
     }
+    __syncthreads();
+    float inv_sum = 1.0f / smem[0];
     
-    // Compute cross-entropy loss and gradient
+    // Normalize and set gradient
     int target_token = targets[b * seq_len + t];
-    float target_prob = __half2float(grad_logits_bt[target_token]);
-    
-    // Add cross-entropy loss
-    atomicAdd(loss_result, -logf(target_prob + 1e-10f));
-    
-    // Set gradient: softmax - one_hot
-    grad_logits_bt[target_token] = __float2half(__half2float(grad_logits_bt[target_token]) - 1.0f);
+    for (int v = tid; v < vocab_size; v += nthreads) {
+        float prob = __half2float(grad_logits_bt[v]) * inv_sum;
+        if (v == target_token) {
+            atomicAdd(loss_result, -logf(prob + 1e-10f));
+            grad_logits_bt[v] = __float2half(prob - 1.0f);
+        } else {
+            grad_logits_bt[v] = __float2half(prob);
+        }
+    }
 }
 
 // Forward pass
@@ -287,7 +312,7 @@ float calculate_loss_gpt(GPT* gpt, unsigned short* d_target_tokens) {
     
     // Compute softmax and cross-entropy loss
     dim3 grid(gpt->batch_size, gpt->seq_len);
-    softmax_cross_entropy_kernel<<<grid, 1>>>(
+    softmax_cross_entropy_kernel<<<grid, 256, 8 * sizeof(float)>>>(
         gpt->d_loss_result, gpt->d_grad_output, gpt->d_output, d_target_tokens,
         gpt->batch_size, gpt->seq_len, gpt->vocab_size
     );
