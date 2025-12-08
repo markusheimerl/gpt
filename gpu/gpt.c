@@ -132,61 +132,108 @@ __global__ static void token_embedding_lookup_kernel(half* embedded, half* token
     }
 }
 
-// CUDA kernel for RMSNorm forward: y = x / sqrt(mean(x^2) + eps)
-__global__ static void rmsnorm_forward_kernel_gpt(half* output, const half* input, int batch_size, int seq_len, int d_model) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = batch_size * seq_len;
-    if (idx >= total) return;
+// CUDA kernel for RMSNorm: y = x / sqrt(mean(x^2) + eps)
+__global__ static void rmsnorm_forward_kernel(half* output, const half* input, int batch_size, int seq_len, int d_model) {
+    extern __shared__ float smem[];
+    
+    int idx = blockIdx.x;
+    if (idx >= batch_size * seq_len) return;
     
     const half* x = &input[idx * d_model];
     half* y = &output[idx * d_model];
     
-    // Compute RMS
+    int tid = threadIdx.x, nthreads = blockDim.x;
+    int warp_id = tid >> 5, lane_id = tid & 31, nwarps = nthreads >> 5;
+    
+    // Parallel sum of squares
     float sum_sq = 0.0f;
-    for (int d = 0; d < d_model; d++) {
+    for (int d = tid; d < d_model; d += nthreads) {
         float val = __half2float(x[d]);
         sum_sq += val * val;
     }
-    float rms = sqrtf(sum_sq / d_model + 1e-6f);
     
-    // y = x / RMS(x)
-    for (int d = 0; d < d_model; d++) {
-        float val = __half2float(x[d]);
-        y[d] = __float2half(val / rms);
+    // Warp-level reduction
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) sum_sq += __shfl_xor_sync(0xffffffff, sum_sq, offset);
+    if (lane_id == 0) smem[warp_id] = sum_sq;
+    __syncthreads();
+    
+    if (warp_id == 0) {
+        sum_sq = (lane_id < nwarps) ? smem[lane_id] : 0.0f;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) sum_sq += __shfl_xor_sync(0xffffffff, sum_sq, offset);
+        if (lane_id == 0) smem[0] = sum_sq;
+    }
+    __syncthreads();
+    
+    float inv_rms = rsqrtf(smem[0] / d_model + 1e-6f);
+    
+    // Parallel normalization
+    for (int d = tid; d < d_model; d += nthreads) {
+        y[d] = __float2half(__half2float(x[d]) * inv_rms);
     }
 }
 
 // CUDA kernel for RMSNorm backward pass: ∂L/∂x = (∂L/∂y)/(x / sqrt(mean(x^2) + eps)) - x⊙(Σ_d (∂L/∂y_d)⊙x_d)/(d_model⊙(x / sqrt(mean(x^2) + eps))³)
-__global__ static void rmsnorm_backward_kernel_gpt(half* grad_input, const half* grad_output, const half* input, int batch_size, int seq_len, int d_model) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = batch_size * seq_len;
-    if (idx >= total) return;
+__global__ static void rmsnorm_backward_kernel(half* grad_input, const half* grad_output, const half* input, int batch_size, int seq_len, int d_model) {
+    extern __shared__ float smem[];
+    
+    int idx = blockIdx.x;
+    if (idx >= batch_size * seq_len) return;
     
     const half* x = &input[idx * d_model];
     const half* dy = &grad_output[idx * d_model];
     half* dx = &grad_input[idx * d_model];
     
-    // Compute RMS
-    float sum_sq = 0.0f;
-    for (int d = 0; d < d_model; d++) {
-        float val = __half2float(x[d]);
-        sum_sq += val * val;
-    }
-    float rms = sqrtf(sum_sq / d_model + 1e-6f);
+    int tid = threadIdx.x, nthreads = blockDim.x;
+    int warp_id = tid >> 5, lane_id = tid & 31, nwarps = nthreads >> 5;
     
-    // Compute Σ_d (∂L/∂y_d)⊙x_d
-    float sum_dy_x = 0.0f;
-    for (int d = 0; d < d_model; d++) {
-        sum_dy_x += __half2float(dy[d]) * __half2float(x[d]);
-    }
-    
-    float rms3 = rms * rms * rms;
-    // ∂L/∂x = (∂L/∂y)/RMS - x⊙(Σ_d (∂L/∂y_d)⊙x_d)/(d_model⊙RMS³)
-    for (int d = 0; d < d_model; d++) {
+    // Parallel computation of sum_sq and sum_dy_x
+    float sum_sq = 0.0f, sum_dy_x = 0.0f;
+    for (int d = tid; d < d_model; d += nthreads) {
         float x_val = __half2float(x[d]);
         float dy_val = __half2float(dy[d]);
-        float result = (dy_val / rms) - (x_val * sum_dy_x) / (d_model * rms3);
-        dx[d] = __float2half(result);
+        sum_sq += x_val * x_val;
+        sum_dy_x += dy_val * x_val;
+    }
+    
+    // Reduce sum_sq
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) sum_sq += __shfl_xor_sync(0xffffffff, sum_sq, offset);
+    if (lane_id == 0) smem[warp_id] = sum_sq;
+    __syncthreads();
+    if (warp_id == 0) {
+        sum_sq = (lane_id < nwarps) ? smem[lane_id] : 0.0f;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) sum_sq += __shfl_xor_sync(0xffffffff, sum_sq, offset);
+        if (lane_id == 0) smem[0] = sum_sq;
+    }
+    __syncthreads();
+    float rms_sq = smem[0] / d_model + 1e-6f;
+    float inv_rms = rsqrtf(rms_sq);
+    
+    // Reduce sum_dy_x
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) sum_dy_x += __shfl_xor_sync(0xffffffff, sum_dy_x, offset);
+    if (lane_id == 0) smem[8 + warp_id] = sum_dy_x;
+    __syncthreads();
+    if (warp_id == 0) {
+        sum_dy_x = (lane_id < nwarps) ? smem[8 + lane_id] : 0.0f;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) sum_dy_x += __shfl_xor_sync(0xffffffff, sum_dy_x, offset);
+        if (lane_id == 0) smem[8] = sum_dy_x;
+    }
+    __syncthreads();
+    sum_dy_x = smem[8];
+    
+    // dx = dy/rms - x * sum_dy_x / (d_model * rms^3)
+    //    = dy * inv_rms - x * sum_dy_x * inv_rms^3 / d_model
+    float scale = sum_dy_x * inv_rms * inv_rms * inv_rms / d_model;
+    
+    for (int d = tid; d < d_model; d += nthreads) {
+        float x_val = __half2float(x[d]);
+        float dy_val = __half2float(dy[d]);
+        dx[d] = __float2half(dy_val * inv_rms - x_val * scale);
     }
 }
 
@@ -290,7 +337,7 @@ void forward_pass_gpt(GPT* gpt, unsigned short* d_input_tokens) {
     forward_pass_transformer(gpt->transformer, gpt->d_embedded_input);
     
     // Step 3: RMSNorm on transformer output
-    rmsnorm_forward_kernel_gpt<<<(gpt->batch_size * gpt->seq_len + 255) / 256, 256>>>(
+    rmsnorm_forward_kernel<<<gpt->batch_size * gpt->seq_len, 256, 8 * sizeof(float)>>>(
         gpt->d_norm_output,
         gpt->transformer->mlp_layers[gpt->num_layers-1]->d_output,
         gpt->batch_size,
@@ -352,7 +399,7 @@ void backward_pass_gpt(GPT* gpt, unsigned short* d_input_tokens) {
               &beta, gpt->d_grad_norm_output, gpt->seq_flat_d_model_layout);
     
     // Step 3 (backward): Backward pass through RMSNorm
-    rmsnorm_backward_kernel_gpt<<<(gpt->batch_size * gpt->seq_len + 255) / 256, 256>>>(
+    rmsnorm_backward_kernel<<<gpt->batch_size * gpt->seq_len, 256, 16 * sizeof(float)>>>(
         gpt->transformer->mlp_layers[gpt->num_layers-1]->d_grad_output,
         gpt->d_grad_norm_output,
         gpt->transformer->mlp_layers[gpt->num_layers-1]->d_output,
