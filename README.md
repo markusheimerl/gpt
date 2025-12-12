@@ -16,7 +16,7 @@ The implementation uses BLAS (Basic Linear Algebra Subprograms) for efficient ma
 ## How to run
 ```bash
 sudo apt update
-sudo apt install clang time libopenblas-dev nvidia-cuda-toolkit
+sudo apt install clang time libopenblas-dev
 git clone --recurse-submodules https://github.com/markusheimerl/gpt
 cd gpt/
 wget "https://drive.usercontent.google.com/download?confirm=t&id=17lurm_zFxY-o18NoZVwuxgTknqMPQM6S" -O - | gzip -d > corpus.txt
