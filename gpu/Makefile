@@ -33,6 +33,9 @@ run: train.out
 cont: train.out
 	@time ./train.out $$(ls -t *_gpt.bin 2>/dev/null | head -n1)
 
+midtrain: train.out
+	@time ./train.out $$(ls -t *_gpt.bin 2>/dev/null | head -n1) ../corpus_midtrain.txt
+
 clean:
 	rm -f *.out *.o *.csv
 	$(MAKE) -C ../transformer/gpu clean
