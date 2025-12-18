@@ -174,7 +174,7 @@ int main(int argc, char* argv[]) {
         }
         
         // Generate sample text
-        if(!argv[2]) {
+        if(argc <= 2) {
             printf("\n--- Sample ---\n");
             generate_text(gpt, 0.001f, d_input_tokens, "<|bos|>The capital of France is", 64);
             generate_text(gpt, 0.001f, d_input_tokens, "<|bos|>The chemical symbol of gold is", 64);
