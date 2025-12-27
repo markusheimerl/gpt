@@ -36,6 +36,14 @@ void generate_text(GPT* gpt, float temperature, unsigned short* d_input_tokens, 
     float* h_logits = (float*)malloc(gpt->vocab_size * sizeof(float));
     half* h_logits_half = (half*)malloc(gpt->vocab_size * sizeof(half));
     
+    // Precompute "<|assistant_end|>" as tokens
+    const char* end_marker = "<|assistant_end|>";
+    int end_marker_len = (strlen(end_marker) + 1) / 2;
+    unsigned short* end_tokens = (unsigned short*)malloc(end_marker_len * sizeof(unsigned short));
+    for (int i = 0; i < end_marker_len; i++) {
+        end_tokens[i] = (unsigned short)((unsigned char)end_marker[i * 2] << 8) | ((unsigned long)(i * 2 + 1) < strlen(end_marker) ? (unsigned char)end_marker[i * 2 + 1] : ' ');
+    }
+    
     // Generate tokens one at a time
     for (int pos = (strlen(bos) + 1) / 2 - 1; pos < gen_len; pos++) {
         // Copy current sequence to device
@@ -85,12 +93,28 @@ void generate_text(GPT* gpt, float temperature, unsigned short* d_input_tokens, 
         h_tokens[pos + 1] = next_token;
         printf("%c%c", (char)(next_token >> 8), (char)(next_token & 0xFF));
         fflush(stdout);
+        
+        // Check if we've generated the end marker
+        if (pos + 2 >= end_marker_len) {
+            int match = 1;
+            for (int i = 0; i < end_marker_len; i++) {
+                if (h_tokens[pos + 2 - end_marker_len + i] != end_tokens[i]) {
+                    match = 0;
+                    break;
+                }
+            }
+            if (match) {
+                free(end_tokens);
+                break;
+            }
+        }
     }
     
     printf("\"\n");
     free(h_tokens);
     free(h_logits);
     free(h_logits_half);
+    free(end_tokens);
 }
 
 int main(int argc, char* argv[]) {
@@ -187,12 +211,12 @@ int main(int argc, char* argv[]) {
         } else {
             // Generate sample text
             printf("\n--- Sample ---\n");
-            generate_text(gpt, 0.001f, d_input_tokens, "<|bos|><|user_start|>What is 2+2?<|user_end|>\n<|assistant_start|>", 128);
-            generate_text(gpt, 0.001f, d_input_tokens, "<|bos|><|user_start|>Explain how photosynthesis works.<|user_end|>\n<|assistant_start|>", 128);
-            generate_text(gpt, 0.001f, d_input_tokens, "<|bos|><|user_start|>Write a Python function to reverse a string.<|user_end|>\n<|assistant_start|>", 128);
-            generate_text(gpt, 0.001f, d_input_tokens, "<|bos|><|user_start|>Translate to Spanish: Hello, how are you?<|user_end|>\n<|assistant_start|>", 128);
-            generate_text(gpt, 0.001f, d_input_tokens, "<|bos|><|user_start|>What is the capital of Japan?<|user_end|>\n<|assistant_start|>", 128);
-            generate_text(gpt, 0.001f, d_input_tokens, "<|bos|><|user_start|>Solve: If 3x + 5 = 20, what is x?<|user_end|>\n<|assistant_start|>", 128);
+            generate_text(gpt, 0.001f, d_input_tokens, "<|bos|><|user_start|>search for the file \"process.txt\" in the current directory<|user_end|><|assistant_start|>", 256);
+            generate_text(gpt, 0.001f, d_input_tokens, "<|bos|><|user_start|>Gets list of folders containing files with changes.<|user_end|><|assistant_start|>", 256);
+            generate_text(gpt, 0.001f, d_input_tokens, "<|bos|><|user_start|>Close the current screen session<|user_end|><|assistant_start|>", 256);
+            generate_text(gpt, 0.001f, d_input_tokens, "<|bos|><|user_start|>Print list of disk and mountpoint of disks matching \"/dev/sd*\"<|user_end|><|assistant_start|>", 256);
+            generate_text(gpt, 0.001f, d_input_tokens, "<|bos|><|user_start|>display the html, javascript and text files in the current folder<|user_end|><|assistant_start|>", 256);
+            generate_text(gpt, 0.001f, d_input_tokens, "<|bos|><|user_start|>search for the file test2 in the current folder<|user_end|><|assistant_start|>", 256);
             printf("--- End ---\n\n");
         }
         
