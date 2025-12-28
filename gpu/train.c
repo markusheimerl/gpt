@@ -145,24 +145,31 @@ int main(int argc, char* argv[]) {
     
     printf("Parameters: ~%.1fM\n", (float)(gpt->vocab_size * d_model + num_layers * ((size_t)4 * d_model * d_model + d_model * hidden_dim + hidden_dim * d_model)) / 1e6f);
     
-    // Create shuffled indices for random sampling without replacement
-    size_t total_sequences = (get_file_size(corpus_file) - 2) / (2 * seq_len);
-    size_t* shuffled_indices = create_shuffled_indices(total_sequences);
-    
-    // Allocate host buffers for sequences
-    size_t sequences_per_chunk = (128 * 1024 * 1024) / (seq_len * 2);
-    unsigned short* input_tokens = (unsigned short*)malloc(sequences_per_chunk * seq_len * sizeof(unsigned short));
-    unsigned short* target_tokens = (unsigned short*)malloc(sequences_per_chunk * seq_len * sizeof(unsigned short));
-    
     // Allocate device buffers
     unsigned short *d_input_tokens, *d_target_tokens;
     CHECK_CUDA(cudaMalloc(&d_input_tokens, batch_size * seq_len * sizeof(unsigned short)));
     CHECK_CUDA(cudaMalloc(&d_target_tokens, batch_size * seq_len * sizeof(unsigned short)));
     
-    // Training loop: process corpus in chunks with random sampling
+    int is_midtraining = (argc > 2);
+    size_t total_sequences = is_midtraining ? count_lines(corpus_file) : (get_file_size(corpus_file) - 2) / (2 * seq_len);
+    size_t* shuffled_indices = is_midtraining ? NULL : create_shuffled_indices(total_sequences);
+    
+    // Allocate host buffers for sequences
+    size_t sequences_per_chunk = (128 * 1024 * 1024) / (seq_len * 2);
+    unsigned short* input_tokens = (unsigned short*)malloc(sequences_per_chunk * seq_len * sizeof(unsigned short));
+    unsigned short* target_tokens = (unsigned short*)malloc(sequences_per_chunk * seq_len * sizeof(unsigned short));
+    unsigned char* loss_mask = is_midtraining ? (unsigned char*)malloc(sequences_per_chunk * seq_len * sizeof(unsigned char)) : NULL;
+    unsigned char* d_loss_mask = NULL;
+    if (is_midtraining) CHECK_CUDA(cudaMalloc(&d_loss_mask, batch_size * seq_len * sizeof(unsigned char)));
+    
+    // Training loop: process corpus in chunks
     for (size_t chunk_idx = 0; chunk_idx < total_sequences / sequences_per_chunk; chunk_idx++) {
-        // Sample next chunk of sequences from shuffled corpus
-        sample_sequences(corpus_file, &shuffled_indices[chunk_idx * sequences_per_chunk], seq_len, input_tokens, target_tokens, sequences_per_chunk);
+        // Load sequences
+        if (is_midtraining) {
+            load_midtraining_sequences(corpus_file, seq_len, input_tokens, target_tokens, loss_mask, chunk_idx * sequences_per_chunk, sequences_per_chunk);
+        } else {
+            sample_sequences(corpus_file, &shuffled_indices[chunk_idx * sequences_per_chunk], seq_len, input_tokens, target_tokens, sequences_per_chunk);
+        }
         
         // Train on all batches in this chunk
         for (int batch = 0; batch < (int)(sequences_per_chunk / batch_size); batch++) {
@@ -172,11 +179,18 @@ int main(int argc, char* argv[]) {
             CHECK_CUDA(cudaMemcpy(d_input_tokens, &input_tokens[batch * batch_size * seq_len], batch_size * seq_len * sizeof(unsigned short), cudaMemcpyHostToDevice));
             CHECK_CUDA(cudaMemcpy(d_target_tokens, &target_tokens[batch * batch_size * seq_len], batch_size * seq_len * sizeof(unsigned short), cudaMemcpyHostToDevice));
             
+            int num_loss_tokens = batch_size * seq_len;
+            if (is_midtraining) {
+                CHECK_CUDA(cudaMemcpy(d_loss_mask, &loss_mask[batch * batch_size * seq_len], batch_size * seq_len * sizeof(unsigned char), cudaMemcpyHostToDevice));
+                num_loss_tokens = 0;
+                for (int i = 0; i < batch_size * seq_len; i++) num_loss_tokens += loss_mask[batch * batch_size * seq_len + i];
+            }
+            
             // Forward pass
             forward_pass_gpt(gpt, d_input_tokens);
             
             // Calculate loss
-            float loss = calculate_loss_gpt(gpt, d_target_tokens);
+            float loss = calculate_loss_gpt(gpt, d_target_tokens, d_loss_mask, num_loss_tokens);
             if (loss >= 12.0) raise(SIGINT);
             
             // Backward pass
@@ -232,9 +246,11 @@ int main(int argc, char* argv[]) {
     // Cleanup
     free(input_tokens);
     free(target_tokens);
+    if (loss_mask) free(loss_mask);
     CHECK_CUDA(cudaFree(d_input_tokens));
     CHECK_CUDA(cudaFree(d_target_tokens));
-    free(shuffled_indices);
+    if (d_loss_mask) CHECK_CUDA(cudaFree(d_loss_mask));
+    if (shuffled_indices) free(shuffled_indices);
     free_gpt(gpt);
     CHECK_CUBLASLT(cublasLtDestroy(cublaslt_handle));
     
