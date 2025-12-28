@@ -147,7 +147,7 @@ int main(void) {
     CHECK_CUBLASLT(cublasLtCreate(&global_handle));
     
     // Load the latest model
-    const char* model_file = "checkpoint_gpt.bin";
+    const char* model_file = "20251228_002831_gpt.bin";
     FILE* test = fopen(model_file, "rb");
     if (!test) {
         FILE* pipe = popen("ls -t *_gpt.bin 2>/dev/null | head -n1", "r");
