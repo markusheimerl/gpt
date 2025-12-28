@@ -40,8 +40,16 @@ void generate_text(GPT* gpt, float temperature, unsigned short* d_input_tokens, 
     const char* end_marker = "<|assistant_end|>";
     int end_marker_len = strlen(end_marker);
     
+    // Buffer for generated text (to check for end marker before printing)
+    char output_buffer[2048];
+    int output_len = 0;
+    int printed_len = 0;
+    
     // Generate tokens one at a time
-    for (int pos = (strlen(bos) + 1) / 2 - 1; pos < gen_len; pos++) {
+    int pos_start = (strlen(bos) + 1) / 2 - 1;
+    int done = 0;
+    
+    for (int pos = pos_start; pos < gen_len && !done; pos++) {
         // Copy current sequence to device
         CHECK_CUDA(cudaMemcpy(d_input_tokens, h_tokens, gpt->seq_len * sizeof(unsigned short), cudaMemcpyHostToDevice));
         
@@ -87,26 +95,41 @@ void generate_text(GPT* gpt, float temperature, unsigned short* d_input_tokens, 
         
         // Add sampled token to sequence
         h_tokens[pos + 1] = next_token;
-        printf("%c%c", (char)(next_token >> 8), (char)(next_token & 0xFF));
-        fflush(stdout);
         
-        // Check if we've generated the end marker (check last N characters, not tokens!)
-        if ((pos + 2) * 2 >= end_marker_len) {  // Have at least end_marker_len characters
-            int num_chars = (pos + 2) * 2;
-            int match = 1;
-            for (int i = 0; i < end_marker_len; i++) {
-                int char_idx = num_chars - end_marker_len + i;
-                int token_idx = char_idx / 2;
-                int byte_idx = char_idx % 2;
-                char c = (byte_idx == 0) ? (char)(h_tokens[token_idx] >> 8) : (char)(h_tokens[token_idx] & 0xFF);
-                if (c != end_marker[i]) {
-                    match = 0;
-                    break;
-                }
+        // Add to output buffer
+        if (output_len < (int)sizeof(output_buffer) - 3) {
+            output_buffer[output_len++] = (char)(next_token >> 8);
+            output_buffer[output_len++] = (char)(next_token & 0xFF);
+            output_buffer[output_len] = '\0';
+        }
+        
+        // Check if we have the end marker in our buffer
+        char* marker_pos = strstr(output_buffer, end_marker);
+        if (marker_pos) {
+            // Found end marker - print everything up to it
+            int pos_in_buffer = marker_pos - output_buffer;
+            while (printed_len < pos_in_buffer) {
+                putchar(output_buffer[printed_len]);
+                printed_len++;
             }
-            if (match) {
-                break;
-            }
+            done = 1;
+            break;
+        }
+        
+        // Print any complete characters that are safe (not potentially part of end marker)
+        // Keep at least end_marker_len characters in buffer to check for end marker
+        while (printed_len < output_len - end_marker_len && printed_len < output_len) {
+            putchar(output_buffer[printed_len]);
+            fflush(stdout);
+            printed_len++;
+        }
+    }
+    
+    // Print any remaining characters if we didn't find the end marker
+    if (!done) {
+        while (printed_len < output_len) {
+            putchar(output_buffer[printed_len]);
+            printed_len++;
         }
     }
     
