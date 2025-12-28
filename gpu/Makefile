@@ -43,7 +43,7 @@ midtrain: train.out
 	@time ./train.out $$(ls -t *_gpt.bin 2>/dev/null | head -n1) ../corpus_midtrain.txt
 
 chat: chat.out
-	@./chat.out
+	@./chat.out $$(ls -t *_gpt.bin 2>/dev/null | head -n1)
 
 clean:
 	rm -f *.out *.o *.csv

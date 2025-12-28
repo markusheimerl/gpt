@@ -139,28 +139,23 @@ void generate_response(GPT* gpt, const char* question, unsigned short* h_tokens,
     printf("\n");
 }
 
-int main(void) {
+int main(int argc, char* argv[]) {
     srand(time(NULL));
     signal(SIGINT, cleanup_and_exit);
     
     // Initialize cuBLAS
     CHECK_CUBLASLT(cublasLtCreate(&global_handle));
     
-    // Load the latest model
-    const char* model_file = "20251228_002831_gpt.bin";
-    FILE* test = fopen(model_file, "rb");
-    if (!test) {
-        FILE* pipe = popen("ls -t *_gpt.bin 2>/dev/null | head -n1", "r");
-        if (pipe) {
-            static char latest[256];
-            if (fgets(latest, sizeof(latest), pipe)) {
-                latest[strcspn(latest, "\n")] = 0;
-                if (strlen(latest) > 0) model_file = latest;
-            }
-            pclose(pipe);
-        }
+    // Determine model file
+    const char* model_file = NULL;
+    
+    if (argc > 1) {
+        // Model file provided via command line
+        model_file = argv[1];
     } else {
-        fclose(test);
+        fprintf(stderr, "Usage: %s <model_file.bin>\n", argv[0]);
+        cublasLtDestroy(global_handle);
+        return 1;
     }
     
     // Load model with batch_size=1 for inference
@@ -169,6 +164,7 @@ int main(void) {
     global_gpt = load_gpt(model_file, 1, seq_len, global_handle);
     if (!global_gpt) {
         fprintf(stderr, "Failed to load model\n");
+        cublasLtDestroy(global_handle);
         return 1;
     }
     printf("Model loaded. Ready!\n");
