@@ -204,7 +204,7 @@ int main(int argc, char* argv[]) {
     }
     
     // Allocate host buffers for sequences
-    size_t sequences_per_chunk = (64 * 1024 * 1024) / (seq_len * 2);
+    size_t sequences_per_chunk = (32 * 1024 * 1024) / (seq_len * 2);
     unsigned short* input_tokens = (unsigned short*)malloc(sequences_per_chunk * seq_len * sizeof(unsigned short));
     unsigned short* target_tokens = (unsigned short*)malloc(sequences_per_chunk * seq_len * sizeof(unsigned short));
     
