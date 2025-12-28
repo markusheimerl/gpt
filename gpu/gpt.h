@@ -101,7 +101,7 @@ typedef struct {
 GPT* init_gpt(int seq_len, int d_model, int hidden_dim, int num_layers, int batch_size, cublasLtHandle_t cublaslt_handle);
 void free_gpt(GPT* gpt);
 void forward_pass_gpt(GPT* gpt, unsigned short* d_input_tokens);
-float calculate_loss_gpt(GPT* gpt, unsigned short* d_target_tokens);
+float calculate_loss_gpt(GPT* gpt, unsigned short* d_target_tokens, unsigned char* d_loss_mask, int num_masked_tokens);
 void zero_gradients_gpt(GPT* gpt);
 void backward_pass_gpt(GPT* gpt, unsigned short* d_input_tokens);
 void update_weights_gpt(GPT* gpt, float learning_rate, int batch_size);

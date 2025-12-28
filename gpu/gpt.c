@@ -254,14 +254,17 @@ __global__ static void token_embedding_grad_kernel(half* token_embedding_grad, h
     }
 }
 
-// CUDA kernel for softmax and cross-entropy loss computation
-__global__ static void softmax_cross_entropy_kernel(float* loss_result, half* grad_logits, half* logits, unsigned short* targets, int batch_size, int seq_len, int vocab_size) {
+// CUDA kernel for softmax and cross-entropy loss computation with masking
+__global__ static void softmax_cross_entropy_kernel(float* loss_result, half* grad_logits, half* logits, unsigned short* targets, unsigned char* loss_mask, int batch_size, int seq_len, int vocab_size) {
     extern __shared__ float smem[];
     
     int b = blockIdx.x;
     int t = blockIdx.y;
     
     if (b >= batch_size || t >= seq_len) return;
+    
+    // Check if this position should contribute to loss
+    unsigned char mask = loss_mask[b * seq_len + t];
     
     size_t logits_offset = (size_t)b * seq_len * vocab_size + t * vocab_size;
     half* logits_bt = &logits[logits_offset];
@@ -312,11 +315,15 @@ __global__ static void softmax_cross_entropy_kernel(float* loss_result, half* gr
     int target_token = targets[b * seq_len + t];
     for (int v = tid; v < vocab_size; v += nthreads) {
         float prob = __half2float(grad_logits_bt[v]) * inv_sum;
-        if (v == target_token) {
+        if (mask && v == target_token) {
+            // Only accumulate loss for masked positions
             atomicAdd(loss_result, -logf(prob + 1e-10f));
             grad_logits_bt[v] = __float2half(prob - 1.0f);
-        } else {
+        } else if (mask) {
             grad_logits_bt[v] = __float2half(prob);
+        } else {
+            // Zero gradient for unmasked positions
+            grad_logits_bt[v] = __float2half(0.0f);
         }
     }
 }
@@ -353,14 +360,14 @@ void forward_pass_gpt(GPT* gpt, unsigned short* d_input_tokens) {
 }
 
 // Calculate loss
-float calculate_loss_gpt(GPT* gpt, unsigned short* d_target_tokens) {
+float calculate_loss_gpt(GPT* gpt, unsigned short* d_target_tokens, unsigned char* d_loss_mask, int num_masked_tokens) {
     // Reset loss accumulator
     CHECK_CUDA(cudaMemset(gpt->d_loss_result, 0, sizeof(float)));
     
     // Compute softmax and cross-entropy loss
     dim3 grid(gpt->batch_size, gpt->seq_len);
     softmax_cross_entropy_kernel<<<grid, 256, 8 * sizeof(float)>>>(
-        gpt->d_loss_result, gpt->d_grad_output, gpt->d_output, d_target_tokens,
+        gpt->d_loss_result, gpt->d_grad_output, gpt->d_output, d_target_tokens, d_loss_mask,
         gpt->batch_size, gpt->seq_len, gpt->vocab_size
     );
     
@@ -368,7 +375,8 @@ float calculate_loss_gpt(GPT* gpt, unsigned short* d_target_tokens) {
     float total_loss;
     CHECK_CUDA(cudaMemcpy(&total_loss, gpt->d_loss_result, sizeof(float), cudaMemcpyDeviceToHost));
     
-    return total_loss / (gpt->batch_size * gpt->seq_len);
+    // Normalize by number of masked tokens
+    return (num_masked_tokens > 0) ? (total_loss / num_masked_tokens) : 0.0f;
 }
 
 // Zero gradients

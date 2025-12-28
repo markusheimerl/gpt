@@ -117,7 +117,7 @@ void generate_text(GPT* gpt, float temperature, unsigned short* d_input_tokens, 
 }
 
 // Print diagnostic information about the first batch
-void print_batch_diagnostic(unsigned short* input_tokens, int batch_size, int seq_len, size_t chunk_idx) {
+void print_batch_diagnostic(unsigned short* input_tokens, unsigned char* loss_mask, int batch_size, int seq_len, size_t chunk_idx) {
     printf("\n========== BATCH DIAGNOSTIC (Chunk %zu, First Batch) ==========\n", chunk_idx);
     
     for (int b = 0; b < batch_size; b++) {
@@ -125,14 +125,20 @@ void print_batch_diagnostic(unsigned short* input_tokens, int batch_size, int se
         
         // Convert tokens back to characters and print
         int last_nonspace = -1;
+        int masked_tokens = 0;
         for (int t = 0; t < seq_len; t++) {
             unsigned short token = input_tokens[b * seq_len + t];
             char c1 = (char)(token >> 8);
             char c2 = (char)(token & 0xFF);
             
             // Track last non-space position
-            if (token != 0x2020) {  // not "  "
+            if (token != 0x2020) {
                 last_nonspace = t;
+            }
+            
+            // Count masked tokens
+            if (loss_mask[b * seq_len + t]) {
+                masked_tokens++;
             }
             
             // Print with special handling for non-printable chars
@@ -148,8 +154,8 @@ void print_batch_diagnostic(unsigned short* input_tokens, int batch_size, int se
             }
         }
         printf("\"\n");
-        printf("              (content ends at token %d, %d chars, %d padding tokens)\n", 
-               last_nonspace, (last_nonspace + 1) * 2, seq_len - last_nonspace - 1);
+        printf("              (content ends at token %d, %d chars, %d padding tokens, %d masked for loss)\n", 
+               last_nonspace, (last_nonspace + 1) * 2, seq_len - last_nonspace - 1, masked_tokens);
     }
     
     printf("===============================================================\n\n");
@@ -204,32 +210,37 @@ int main(int argc, char* argv[]) {
     }
     
     // Allocate host buffers for sequences
-    size_t sequences_per_chunk = (64 * 1024 * 1024) / (seq_len * 2);
+    size_t sequences_per_chunk = (128 * 1024 * 1024) / (seq_len * 2);
     unsigned short* input_tokens = (unsigned short*)malloc(sequences_per_chunk * seq_len * sizeof(unsigned short));
     unsigned short* target_tokens = (unsigned short*)malloc(sequences_per_chunk * seq_len * sizeof(unsigned short));
+    unsigned char* loss_mask = (unsigned char*)malloc(sequences_per_chunk * seq_len * sizeof(unsigned char));
     
     // Allocate device buffers
     unsigned short *d_input_tokens, *d_target_tokens;
+    unsigned char *d_loss_mask;
     CHECK_CUDA(cudaMalloc(&d_input_tokens, batch_size * seq_len * sizeof(unsigned short)));
     CHECK_CUDA(cudaMalloc(&d_target_tokens, batch_size * seq_len * sizeof(unsigned short)));
+    CHECK_CUDA(cudaMalloc(&d_loss_mask, batch_size * seq_len * sizeof(unsigned char)));
     
     // Training loop: process corpus in chunks with random sampling
     for (size_t chunk_idx = 0; chunk_idx < total_sequences / sequences_per_chunk; chunk_idx++) {
         // Sample next chunk of sequences from shuffled corpus
         if (argc > 2) {
-            // Midtraining: use line-based padded sampling
+            // Midtraining: use line-based padded sampling with loss masking
             sample_sequences_line_padded(corpus_file, line_positions, 
                                         &shuffled_indices[chunk_idx * sequences_per_chunk], 
-                                        seq_len, input_tokens, target_tokens, sequences_per_chunk);
+                                        seq_len, input_tokens, target_tokens, loss_mask, sequences_per_chunk);
         } else {
             // Regular training: use continuous sampling
             sample_sequences(corpus_file, &shuffled_indices[chunk_idx * sequences_per_chunk], 
                            seq_len, input_tokens, target_tokens, sequences_per_chunk);
+            // For regular training, include all tokens in loss
+            memset(loss_mask, 1, sequences_per_chunk * seq_len * sizeof(unsigned char));
         }
         
         // Print diagnostic for first batch of each chunk (only in midtraining mode)
         if (argc > 2) {
-            print_batch_diagnostic(input_tokens, batch_size, seq_len, chunk_idx);
+            print_batch_diagnostic(input_tokens, loss_mask, batch_size, seq_len, chunk_idx);
         }
         
         // Train on all batches in this chunk
@@ -239,12 +250,21 @@ int main(int argc, char* argv[]) {
             // Copy batch to device
             CHECK_CUDA(cudaMemcpy(d_input_tokens, &input_tokens[batch * batch_size * seq_len], batch_size * seq_len * sizeof(unsigned short), cudaMemcpyHostToDevice));
             CHECK_CUDA(cudaMemcpy(d_target_tokens, &target_tokens[batch * batch_size * seq_len], batch_size * seq_len * sizeof(unsigned short), cudaMemcpyHostToDevice));
+            CHECK_CUDA(cudaMemcpy(d_loss_mask, &loss_mask[batch * batch_size * seq_len], batch_size * seq_len * sizeof(unsigned char), cudaMemcpyHostToDevice));
+            
+            // Count masked tokens for proper loss normalization
+            int num_masked_tokens = 0;
+            for (int i = 0; i < batch_size * seq_len; i++) {
+                if (loss_mask[batch * batch_size * seq_len + i]) {
+                    num_masked_tokens++;
+                }
+            }
             
             // Forward pass
             forward_pass_gpt(gpt, d_input_tokens);
             
             // Calculate loss
-            float loss = calculate_loss_gpt(gpt, d_target_tokens);
+            float loss = calculate_loss_gpt(gpt, d_target_tokens, d_loss_mask, num_masked_tokens);
             if (loss >= 12.0) raise(SIGINT);
             
             // Backward pass
@@ -256,11 +276,12 @@ int main(int argc, char* argv[]) {
             update_weights_gpt(gpt, lr, batch_size);
             
             CHECK_CUDA(cudaDeviceSynchronize()); struct timespec end; clock_gettime(CLOCK_MONOTONIC, &end);
-            printf("Chunk [%zu/%zu], Batch [%d/%d], Loss: %.6f, LR: %.7f, dt: %.2fms, tok/s: %.0f, bpb: %.4f, ETA: %.1fh\n",
+            printf("Chunk [%zu/%zu], Batch [%d/%d], Loss: %.6f, LR: %.7f, dt: %.2fms, tok/s: %.0f, bpb: %.4f, masked: %d, ETA: %.1fh\n",
                    chunk_idx, total_sequences / sequences_per_chunk, batch, (int)(sequences_per_chunk / batch_size),
                    loss, lr, ((end.tv_sec - start.tv_sec) * 1000.0 + (end.tv_nsec - start.tv_nsec) / 1e6),
                    (batch_size * seq_len) / ((end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9),
                    loss / log(2.0) / 2.0,
+                   num_masked_tokens,
                    ((double)total_sequences / batch_size - (chunk_idx * (sequences_per_chunk / batch_size) + batch) - 1) * ((end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9) / 3600.0);
         }
         
@@ -300,8 +321,10 @@ int main(int argc, char* argv[]) {
     // Cleanup
     free(input_tokens);
     free(target_tokens);
+    free(loss_mask);
     CHECK_CUDA(cudaFree(d_input_tokens));
     CHECK_CUDA(cudaFree(d_target_tokens));
+    CHECK_CUDA(cudaFree(d_loss_mask));
     free(shuffled_indices);
     if (line_positions) free(line_positions);
     free_gpt(gpt);
