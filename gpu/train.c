@@ -241,8 +241,8 @@ int main(int argc, char* argv[]) {
             generate_text(gpt, 0.001f, d_input_tokens, "<|bos|><|user_start|>Gets list of folders containing files with changes.<|user_end|><|assistant_start|>", 256);
             generate_text(gpt, 0.001f, d_input_tokens, "<|bos|><|user_start|>Close the current screen session<|user_end|><|assistant_start|>", 256);
             generate_text(gpt, 0.001f, d_input_tokens, "<|bos|><|user_start|>Print list of disk and mountpoint of disks matching \"/dev/sd*\"<|user_end|><|assistant_start|>", 256);
-            generate_text(gpt, 0.001f, d_input_tokens, "<|bos|><|user_start|>display the html, javascript and text files in the current folder<|user_end|><|assistant_start|>", 256);
-            generate_text(gpt, 0.001f, d_input_tokens, "<|bos|><|user_start|>search for the file test2 in the current folder<|user_end|><|assistant_start|>", 256);
+            generate_text(gpt, 0.001f, d_input_tokens, "<|bos|><|user_start|>display the html, javascript and text files in the current folder.<|user_end|><|assistant_start|>", 256);
+            generate_text(gpt, 0.001f, d_input_tokens, "<|bos|><|user_start|>search for the file test2 in the current folder.<|user_end|><|assistant_start|>", 256);
             printf("--- End ---\n\n");
         }
         
