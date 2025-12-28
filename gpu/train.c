@@ -36,13 +36,9 @@ void generate_text(GPT* gpt, float temperature, unsigned short* d_input_tokens, 
     float* h_logits = (float*)malloc(gpt->vocab_size * sizeof(float));
     half* h_logits_half = (half*)malloc(gpt->vocab_size * sizeof(half));
     
-    // Precompute "<|assistant_end|>" as tokens
+    // End marker to detect
     const char* end_marker = "<|assistant_end|>";
-    int end_marker_len = (strlen(end_marker) + 1) / 2;
-    unsigned short* end_tokens = (unsigned short*)malloc(end_marker_len * sizeof(unsigned short));
-    for (int i = 0; i < end_marker_len; i++) {
-        end_tokens[i] = (unsigned short)((unsigned char)end_marker[i * 2] << 8) | ((unsigned long)(i * 2 + 1) < strlen(end_marker) ? (unsigned char)end_marker[i * 2 + 1] : ' ');
-    }
+    int end_marker_len = strlen(end_marker);
     
     // Generate tokens one at a time
     for (int pos = (strlen(bos) + 1) / 2 - 1; pos < gen_len; pos++) {
@@ -94,17 +90,21 @@ void generate_text(GPT* gpt, float temperature, unsigned short* d_input_tokens, 
         printf("%c%c", (char)(next_token >> 8), (char)(next_token & 0xFF));
         fflush(stdout);
         
-        // Check if we've generated the end marker
-        if (pos + 2 >= end_marker_len) {
+        // Check if we've generated the end marker (check last N characters, not tokens!)
+        if ((pos + 2) * 2 >= end_marker_len) {  // Have at least end_marker_len characters
+            int num_chars = (pos + 2) * 2;
             int match = 1;
             for (int i = 0; i < end_marker_len; i++) {
-                if (h_tokens[pos + 2 - end_marker_len + i] != end_tokens[i]) {
+                int char_idx = num_chars - end_marker_len + i;
+                int token_idx = char_idx / 2;
+                int byte_idx = char_idx % 2;
+                char c = (byte_idx == 0) ? (char)(h_tokens[token_idx] >> 8) : (char)(h_tokens[token_idx] & 0xFF);
+                if (c != end_marker[i]) {
                     match = 0;
                     break;
                 }
             }
             if (match) {
-                free(end_tokens);
                 break;
             }
         }
@@ -114,7 +114,6 @@ void generate_text(GPT* gpt, float temperature, unsigned short* d_input_tokens, 
     free(h_tokens);
     free(h_logits);
     free(h_logits_half);
-    free(end_tokens);
 }
 
 int main(int argc, char* argv[]) {
