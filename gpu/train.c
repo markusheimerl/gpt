@@ -34,7 +34,7 @@ void generate_text(GPT* gpt, float temperature, unsigned short* d_input_tokens, 
                       ((size_t)(i * 2 + 1) < bos_len ? (unsigned char)bos[i * 2 + 1] : ' ');
     }
     
-    printf("\"%s%s", bos, (bos_len % 2) ? " " : "");
+    printf("%s%s", bos, (bos_len % 2) ? " " : "");
     fflush(stdout);
     
     float* h_logits = (float*)malloc(gpt->vocab_size * sizeof(float));
@@ -137,7 +137,7 @@ void generate_text(GPT* gpt, float temperature, unsigned short* d_input_tokens, 
         }
     }
     
-    printf("\"\n");
+    printf("%s\n", end_marker);
     free(h_tokens);
     free(h_logits);
     free(h_logits_half);
