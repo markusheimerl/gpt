@@ -116,6 +116,45 @@ void generate_text(GPT* gpt, float temperature, unsigned short* d_input_tokens, 
     free(h_logits_half);
 }
 
+// Print diagnostic information about the first batch
+void print_batch_diagnostic(unsigned short* input_tokens, int batch_size, int seq_len, size_t chunk_idx) {
+    printf("\n========== BATCH DIAGNOSTIC (Chunk %zu, First Batch) ==========\n", chunk_idx);
+    
+    for (int b = 0; b < batch_size; b++) {
+        printf("Sequence %2d: \"", b);
+        
+        // Convert tokens back to characters and print
+        int last_nonspace = -1;
+        for (int t = 0; t < seq_len; t++) {
+            unsigned short token = input_tokens[b * seq_len + t];
+            char c1 = (char)(token >> 8);
+            char c2 = (char)(token & 0xFF);
+            
+            // Track last non-space position
+            if (token != 0x2020) {  // not "  "
+                last_nonspace = t;
+            }
+            
+            // Print with special handling for non-printable chars
+            if (c1 >= 32 && c1 < 127) {
+                printf("%c", c1);
+            } else {
+                printf("<%02X>", (unsigned char)c1);
+            }
+            if (c2 >= 32 && c2 < 127) {
+                printf("%c", c2);
+            } else {
+                printf("<%02X>", (unsigned char)c2);
+            }
+        }
+        printf("\"\n");
+        printf("              (content ends at token %d, %d chars, %d padding tokens)\n", 
+               last_nonspace, (last_nonspace + 1) * 2, seq_len - last_nonspace - 1);
+    }
+    
+    printf("===============================================================\n\n");
+}
+
 int main(int argc, char* argv[]) {
     srand(time(NULL));
     signal(SIGINT, handle_sigint);
@@ -146,11 +185,26 @@ int main(int argc, char* argv[]) {
     printf("Parameters: ~%.1fM\n", (float)(gpt->vocab_size * d_model + num_layers * ((size_t)4 * d_model * d_model + d_model * hidden_dim + hidden_dim * d_model)) / 1e6f);
     
     // Create shuffled indices for random sampling without replacement
-    size_t total_sequences = (get_file_size(corpus_file) - 2) / (2 * seq_len);
-    size_t* shuffled_indices = create_shuffled_indices(total_sequences);
+    size_t total_sequences;
+    size_t* shuffled_indices;
+    size_t* line_positions = NULL;
+    
+    if (argc > 2) {
+        // Midtraining mode: one line per sequence, padded
+        size_t line_count;
+        line_positions = get_line_positions(corpus_file, &line_count);
+        total_sequences = line_count;
+        shuffled_indices = create_shuffled_indices(total_sequences);
+        printf("Midtraining mode: %zu lines\n", line_count);
+    } else {
+        // Regular training: continuous sequences
+        total_sequences = (get_file_size(corpus_file) - 2) / (2 * seq_len);
+        shuffled_indices = create_shuffled_indices(total_sequences);
+        printf("Regular training mode: %zu sequences\n", total_sequences);
+    }
     
     // Allocate host buffers for sequences
-    size_t sequences_per_chunk = (128 * 1024 * 1024) / (seq_len * 2);
+    size_t sequences_per_chunk = (64 * 1024 * 1024) / (seq_len * 2);
     unsigned short* input_tokens = (unsigned short*)malloc(sequences_per_chunk * seq_len * sizeof(unsigned short));
     unsigned short* target_tokens = (unsigned short*)malloc(sequences_per_chunk * seq_len * sizeof(unsigned short));
     
@@ -162,7 +216,21 @@ int main(int argc, char* argv[]) {
     // Training loop: process corpus in chunks with random sampling
     for (size_t chunk_idx = 0; chunk_idx < total_sequences / sequences_per_chunk; chunk_idx++) {
         // Sample next chunk of sequences from shuffled corpus
-        sample_sequences(corpus_file, &shuffled_indices[chunk_idx * sequences_per_chunk], seq_len, input_tokens, target_tokens, sequences_per_chunk);
+        if (argc > 2) {
+            // Midtraining: use line-based padded sampling
+            sample_sequences_line_padded(corpus_file, line_positions, 
+                                        &shuffled_indices[chunk_idx * sequences_per_chunk], 
+                                        seq_len, input_tokens, target_tokens, sequences_per_chunk);
+        } else {
+            // Regular training: use continuous sampling
+            sample_sequences(corpus_file, &shuffled_indices[chunk_idx * sequences_per_chunk], 
+                           seq_len, input_tokens, target_tokens, sequences_per_chunk);
+        }
+        
+        // Print diagnostic for first batch of each chunk (only in midtraining mode)
+        if (argc > 2) {
+            print_batch_diagnostic(input_tokens, batch_size, seq_len, chunk_idx);
+        }
         
         // Train on all batches in this chunk
         for (int batch = 0; batch < (int)(sequences_per_chunk / batch_size); batch++) {
@@ -235,6 +303,7 @@ int main(int argc, char* argv[]) {
     CHECK_CUDA(cudaFree(d_input_tokens));
     CHECK_CUDA(cudaFree(d_target_tokens));
     free(shuffled_indices);
+    if (line_positions) free(line_positions);
     free_gpt(gpt);
     CHECK_CUBLASLT(cublasLtDestroy(cublaslt_handle));
     
