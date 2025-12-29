@@ -100,6 +100,7 @@ int main(int argc, char* argv[]) {
     // Initialize or load model
     if (checkpoint_path) {
         gpt = load_gpt(checkpoint_path, batch_size, seq_len);
+        reset_optimizer_gpt(gpt);
     } else {
         gpt = init_gpt(seq_len, d_model, hidden_dim, num_layers, batch_size);
     }
