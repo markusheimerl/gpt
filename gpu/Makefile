@@ -9,6 +9,9 @@ CUDALIBS = -L/usr/local/cuda/lib64 -lcudart -lcublasLt
 train.out: gpt.o ../transformer/gpu/transformer.o ../transformer/attention/gpu/attention.o ../transformer/mlp/gpu/mlp.o data.o train.o
 	$(CC) gpt.o ../transformer/gpu/transformer.o ../transformer/attention/gpu/attention.o ../transformer/mlp/gpu/mlp.o data.o train.o $(CUDALIBS) $(LDFLAGS) -o $@
 
+chat.out: gpt.o ../transformer/gpu/transformer.o ../transformer/attention/gpu/attention.o ../transformer/mlp/gpu/mlp.o data.o chat.o
+	$(CC) gpt.o ../transformer/gpu/transformer.o ../transformer/attention/gpu/attention.o ../transformer/mlp/gpu/mlp.o data.o chat.o $(CUDALIBS) $(LDFLAGS) -o $@
+
 gpt.o: gpt.c gpt.h
 	$(CC) $(CFLAGS) $(CUDAFLAGS) -c gpt.c -o $@
 
@@ -27,6 +30,9 @@ data.o: ../data.c ../data.h
 train.o: train.c gpt.h ../data.h
 	$(CC) $(CFLAGS) $(CUDAFLAGS) -c train.c -o $@
 
+chat.o: chat.c gpt.h
+	$(CC) $(CFLAGS) $(CUDAFLAGS) -c chat.c -o $@
+
 run: train.out
 	@time ./train.out ../corpus.txt
 
@@ -35,6 +41,9 @@ cont: train.out
 
 finetune: train.out
 	@time ./train.out ../corpus_finetune.txt $$(ls -t *_gpt.bin 2>/dev/null | head -n1)
+
+chat: chat.out
+	@./chat.out $$(ls -t *_gpt.bin 2>/dev/null | head -n1)
 
 clean:
 	rm -f *.out *.o *.csv
