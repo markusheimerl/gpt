@@ -66,12 +66,10 @@ typedef struct {
     
     // Forward pass buffers
     half* d_embedded_input;        // [batch_size x seq_len x d_model]
-    half* d_norm_output;           // [batch_size x seq_len x d_model]
     half* d_output;                // [batch_size x seq_len x vocab_size]
     
     // Backward pass buffers
     half* d_grad_output;           // [batch_size x seq_len x vocab_size]
-    half* d_grad_norm_output;      // [batch_size x seq_len x d_model]
 
     // Loss computation buffer
     float* d_loss_result;          // [1]

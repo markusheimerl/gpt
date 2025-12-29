@@ -44,12 +44,10 @@ GPT* init_gpt(int seq_len, int d_model, int hidden_dim, int num_layers, int batc
     
     // Allocate device memory for forward pass buffers
     CHECK_CUDA(cudaMalloc(&gpt->d_embedded_input, embedded_size * sizeof(half)));
-    CHECK_CUDA(cudaMalloc(&gpt->d_norm_output, embedded_size * sizeof(half)));
     CHECK_CUDA(cudaMalloc(&gpt->d_output, output_size * sizeof(half)));
     
-    // Alias/Allocate device memory for backward pass buffers
+    // Alias device memory for backward pass buffers
     gpt->d_grad_output = gpt->d_output;
-    CHECK_CUDA(cudaMalloc(&gpt->d_grad_norm_output, embedded_size * sizeof(half)));
     
     // Allocate single device float for loss computation
     CHECK_CUDA(cudaMalloc(&gpt->d_loss_result, sizeof(float)));
@@ -106,9 +104,7 @@ void free_gpt(GPT* gpt) {
     cudaFree(gpt->d_token_embedding); cudaFree(gpt->d_token_embedding_grad);
     cudaFree(gpt->d_token_embedding_m); cudaFree(gpt->d_token_embedding_v);
     cudaFree(gpt->d_embedded_input);
-    cudaFree(gpt->d_norm_output);
     cudaFree(gpt->d_output);
-    cudaFree(gpt->d_grad_norm_output);
     
     // Free loss computation buffer
     cudaFree(gpt->d_loss_result);
@@ -129,111 +125,6 @@ __global__ static void token_embedding_lookup_kernel(half* embedded, half* token
     
     for (int d = threadIdx.x; d < d_model; d += blockDim.x) {
         embedded[emb_base + d] = token_embedding[token_base + d];
-    }
-}
-
-// CUDA kernel for RMSNorm: y = x / sqrt(mean(x^2) + eps)
-__global__ static void rmsnorm_forward_kernel(half* output, const half* input, int batch_size, int seq_len, int d_model) {
-    extern __shared__ float smem[];
-    
-    int idx = blockIdx.x;
-    if (idx >= batch_size * seq_len) return;
-    
-    const half* x = &input[idx * d_model];
-    half* y = &output[idx * d_model];
-    
-    int tid = threadIdx.x, nthreads = blockDim.x;
-    int warp_id = tid >> 5, lane_id = tid & 31, nwarps = nthreads >> 5;
-    
-    // Parallel sum of squares
-    float sum_sq = 0.0f;
-    for (int d = tid; d < d_model; d += nthreads) {
-        float val = __half2float(x[d]);
-        sum_sq += val * val;
-    }
-    
-    // Warp-level reduction
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) sum_sq += __shfl_xor_sync(0xffffffff, sum_sq, offset);
-    if (lane_id == 0) smem[warp_id] = sum_sq;
-    __syncthreads();
-    
-    if (warp_id == 0) {
-        sum_sq = (lane_id < nwarps) ? smem[lane_id] : 0.0f;
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1) sum_sq += __shfl_xor_sync(0xffffffff, sum_sq, offset);
-        if (lane_id == 0) smem[0] = sum_sq;
-    }
-    __syncthreads();
-    
-    float inv_rms = rsqrtf(smem[0] / d_model + 1e-6f);
-    
-    // Parallel normalization
-    for (int d = tid; d < d_model; d += nthreads) {
-        y[d] = __float2half(__half2float(x[d]) * inv_rms);
-    }
-}
-
-// CUDA kernel for RMSNorm backward pass: ∂L/∂x = (∂L/∂y)/(x / sqrt(mean(x^2) + eps)) - x⊙(Σ_d (∂L/∂y_d)⊙x_d)/(d_model⊙(x / sqrt(mean(x^2) + eps))³)
-__global__ static void rmsnorm_backward_kernel(half* grad_input, const half* grad_output, const half* input, int batch_size, int seq_len, int d_model) {
-    extern __shared__ float smem[];
-    
-    int idx = blockIdx.x;
-    if (idx >= batch_size * seq_len) return;
-    
-    const half* x = &input[idx * d_model];
-    const half* dy = &grad_output[idx * d_model];
-    half* dx = &grad_input[idx * d_model];
-    
-    int tid = threadIdx.x, nthreads = blockDim.x;
-    int warp_id = tid >> 5, lane_id = tid & 31, nwarps = nthreads >> 5;
-    
-    // Parallel computation of sum_sq and sum_dy_x
-    float sum_sq = 0.0f, sum_dy_x = 0.0f;
-    for (int d = tid; d < d_model; d += nthreads) {
-        float x_val = __half2float(x[d]);
-        float dy_val = __half2float(dy[d]);
-        sum_sq += x_val * x_val;
-        sum_dy_x += dy_val * x_val;
-    }
-    
-    // Reduce sum_sq
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) sum_sq += __shfl_xor_sync(0xffffffff, sum_sq, offset);
-    if (lane_id == 0) smem[warp_id] = sum_sq;
-    __syncthreads();
-    if (warp_id == 0) {
-        sum_sq = (lane_id < nwarps) ? smem[lane_id] : 0.0f;
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1) sum_sq += __shfl_xor_sync(0xffffffff, sum_sq, offset);
-        if (lane_id == 0) smem[0] = sum_sq;
-    }
-    __syncthreads();
-    float rms_sq = smem[0] / d_model + 1e-6f;
-    float inv_rms = rsqrtf(rms_sq);
-    
-    // Reduce sum_dy_x
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) sum_dy_x += __shfl_xor_sync(0xffffffff, sum_dy_x, offset);
-    if (lane_id == 0) smem[8 + warp_id] = sum_dy_x;
-    __syncthreads();
-    if (warp_id == 0) {
-        sum_dy_x = (lane_id < nwarps) ? smem[8 + lane_id] : 0.0f;
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1) sum_dy_x += __shfl_xor_sync(0xffffffff, sum_dy_x, offset);
-        if (lane_id == 0) smem[8] = sum_dy_x;
-    }
-    __syncthreads();
-    sum_dy_x = smem[8];
-    
-    // dx = dy/rms - x * sum_dy_x / (d_model * rms^3)
-    //    = dy * inv_rms - x * sum_dy_x * inv_rms^3 / d_model
-    float scale = sum_dy_x * inv_rms * inv_rms * inv_rms / d_model;
-    
-    for (int d = tid; d < d_model; d += nthreads) {
-        float x_val = __half2float(x[d]);
-        float dy_val = __half2float(dy[d]);
-        dx[d] = __float2half(dy_val * inv_rms - x_val * scale);
     }
 }
 
@@ -336,18 +227,9 @@ void forward_pass_gpt(GPT* gpt, unsigned short* d_input_tokens) {
     // Step 2: Forward pass through transformer
     forward_pass_transformer(gpt->transformer, gpt->d_embedded_input);
     
-    // Step 3: RMSNorm on transformer output
-    rmsnorm_forward_kernel<<<gpt->batch_size * gpt->seq_len, 256, 8 * sizeof(float)>>>(
-        gpt->d_norm_output,
-        gpt->transformer->mlp_layers[gpt->num_layers-1]->d_output,
-        gpt->batch_size,
-        gpt->seq_len,
-        gpt->d_model
-    );
-    
-    // Step 4: Output projection: output = norm_output * token_embedding^T
+    // Step 3: Output projection: output = final_norm_output * token_embedding^T
     LT_MATMUL(gpt, CUBLAS_OP_N, CUBLAS_OP_T, &alpha,
-              gpt->d_norm_output, gpt->seq_flat_d_model_layout,
+              gpt->transformer->d_final_norm_output, gpt->seq_flat_d_model_layout,
               gpt->d_token_embedding, gpt->embedding_layout,
               &beta, gpt->d_output, gpt->seq_flat_vocab_layout);
 }
@@ -385,28 +267,18 @@ void backward_pass_gpt(GPT* gpt, unsigned short* d_input_tokens) {
     const float alpha = 1.0f;
     const float beta = 0.0f;
     
-    // Step 4 (backward): Backward pass through output projection
-    // grad_token_embedding += grad_output^T * norm_output
+    // Step 3 (backward): Backward pass through output projection
+    // grad_token_embedding += grad_output^T * final_norm_output
     LT_MATMUL(gpt, CUBLAS_OP_T, CUBLAS_OP_N, &alpha,
               gpt->d_grad_output, gpt->seq_flat_vocab_layout,
-              gpt->d_norm_output, gpt->seq_flat_d_model_layout,
+              gpt->transformer->d_final_norm_output, gpt->seq_flat_d_model_layout,
               &alpha, gpt->d_token_embedding_grad, gpt->embedding_layout);
     
-    // grad_norm_output = grad_output * token_embedding
+    // grad_final_norm_output = grad_output * token_embedding
     LT_MATMUL(gpt, CUBLAS_OP_N, CUBLAS_OP_N, &alpha,
               gpt->d_grad_output, gpt->seq_flat_vocab_layout,
               gpt->d_token_embedding, gpt->embedding_layout,
-              &beta, gpt->d_grad_norm_output, gpt->seq_flat_d_model_layout);
-    
-    // Step 3 (backward): Backward pass through RMSNorm
-    rmsnorm_backward_kernel<<<gpt->batch_size * gpt->seq_len, 256, 16 * sizeof(float)>>>(
-        gpt->transformer->mlp_layers[gpt->num_layers-1]->d_grad_output,
-        gpt->d_grad_norm_output,
-        gpt->transformer->mlp_layers[gpt->num_layers-1]->d_output,
-        gpt->batch_size,
-        gpt->seq_len,
-        gpt->d_model
-    );
+              &beta, gpt->transformer->d_final_norm_output, gpt->seq_flat_d_model_layout);
     
     // Step 2 (backward): Backward pass through transformer
     backward_pass_transformer(gpt->transformer, gpt->d_embedded_input, gpt->d_embedded_input);

@@ -25,12 +25,10 @@ typedef struct {
     
     // Forward pass buffers
     float* embedded_input;         // [batch_size x seq_len x d_model]
-    float* norm_output;            // [batch_size x seq_len x d_model]
     float* output;                 // [batch_size x seq_len x vocab_size]
     
     // Backward pass buffers
     float* grad_output;            // [batch_size x seq_len x vocab_size]
-    float* grad_norm_output;       // [batch_size x seq_len x d_model]
     
     // Transformer core
     Transformer* transformer;

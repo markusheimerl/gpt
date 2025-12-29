@@ -33,12 +33,10 @@ GPT* init_gpt(int seq_len, int d_model, int hidden_dim, int num_layers, int batc
     
     // Allocate memory for forward pass buffers
     gpt->embedded_input = (float*)malloc(embedded_size * sizeof(float));
-    gpt->norm_output = (float*)malloc(embedded_size * sizeof(float));
     gpt->output = (float*)malloc(output_size * sizeof(float));
     
-    // Alias/Allocate memory for backward pass buffers
+    // Alias memory for backward pass buffers
     gpt->grad_output = gpt->output;
-    gpt->grad_norm_output = (float*)malloc(embedded_size * sizeof(float));
     
     // Initialize token embeddings
     float token_scale = 1.0f / sqrtf(d_model);
@@ -62,9 +60,7 @@ void free_gpt(GPT* gpt) {
     free(gpt->token_embedding); free(gpt->token_embedding_grad);
     free(gpt->token_embedding_m); free(gpt->token_embedding_v);
     free(gpt->embedded_input);
-    free(gpt->norm_output);
     free(gpt->output);
-    free(gpt->grad_norm_output);
     
     free(gpt);
 }
@@ -81,58 +77,6 @@ static void token_embedding_lookup(float* embedded, float* token_embedding, unsi
             for (int d = 0; d < d_model; d++) {
                 embedded[emb_offset + d] = token_embedding[token_emb_offset + d];
             }
-        }
-    }
-}
-
-// RMSNorm forward: y = x / sqrt(mean(x^2) + eps)
-static void rmsnorm_forward_gpt(float* output, const float* input, int batch_size, int seq_len, int d_model) {
-    int total = batch_size * seq_len;
-    
-    for (int idx = 0; idx < total; idx++) {
-        const float* x = &input[idx * d_model];
-        float* y = &output[idx * d_model];
-        
-        // Compute RMS
-        float sum_sq = 0.0f;
-        for (int d = 0; d < d_model; d++) {
-            sum_sq += x[d] * x[d];
-        }
-        float rms = sqrtf(sum_sq / d_model + 1e-6f);
-        
-        // y = x / RMS(x)
-        for (int d = 0; d < d_model; d++) {
-            y[d] = x[d] / rms;
-        }
-    }
-}
-
-// RMSNorm backward: ∂L/∂x = (∂L/∂y)/(x / sqrt(mean(x^2) + eps)) - x⊙(Σ_d (∂L/∂y_d)⊙x_d)/(d_model⊙(x / sqrt(mean(x^2) + eps))³)
-static void rmsnorm_backward_gpt(float* grad_input, const float* grad_output, const float* input, int batch_size, int seq_len, int d_model) {
-    int total = batch_size * seq_len;
-    
-    for (int idx = 0; idx < total; idx++) {
-        const float* x = &input[idx * d_model];
-        const float* dy = &grad_output[idx * d_model];
-        float* dx = &grad_input[idx * d_model];
-        
-        // Compute RMS
-        float sum_sq = 0.0f;
-        for (int d = 0; d < d_model; d++) {
-            sum_sq += x[d] * x[d];
-        }
-        float rms = sqrtf(sum_sq / d_model + 1e-6f);
-        
-        // Compute Σ_d (∂L/∂y_d)⊙x_d
-        float sum_dy_x = 0.0f;
-        for (int d = 0; d < d_model; d++) {
-            sum_dy_x += dy[d] * x[d];
-        }
-        
-        float rms3 = rms * rms * rms;
-        // ∂L/∂x = (∂L/∂y)/RMS - x⊙(Σ_d (∂L/∂y_d)⊙x_d)/(d_model⊙RMS³)
-        for (int d = 0; d < d_model; d++) {
-            dx[d] = (dy[d] / rms) - (x[d] * sum_dy_x) / (d_model * rms3);
         }
     }
 }
@@ -206,17 +150,10 @@ void forward_pass_gpt(GPT* gpt, unsigned short* input_tokens) {
     // Step 2: Forward pass through transformer
     forward_pass_transformer(gpt->transformer, gpt->embedded_input);
     
-    // Step 3: RMSNorm on transformer output
-    rmsnorm_forward_gpt(gpt->norm_output,
-                        gpt->transformer->mlp_layers[gpt->num_layers-1]->output,
-                        gpt->batch_size,
-                        gpt->seq_len,
-                        gpt->d_model);
-    
-    // Step 4: Output projection: output = norm_output * token_embedding^T
+    // Step 3: Output projection: output = final_norm_output * token_embedding^T
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                 gpt->batch_size * gpt->seq_len, gpt->vocab_size, gpt->d_model,
-                1.0f, gpt->norm_output, gpt->d_model,
+                1.0f, gpt->transformer->final_norm_output, gpt->d_model,
                 gpt->token_embedding, gpt->d_model,
                 0.0f, gpt->output, gpt->vocab_size);
 }
@@ -241,28 +178,20 @@ void zero_gradients_gpt(GPT* gpt) {
 
 // Backward pass
 void backward_pass_gpt(GPT* gpt, unsigned short* input_tokens) {
-    // Step 4 (backward): Backward pass through output projection
-    // grad_token_embedding += grad_output^T * norm_output
+    // Step 3 (backward): Backward pass through output projection
+    // grad_token_embedding += grad_output^T * final_norm_output
     cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
                 gpt->vocab_size, gpt->d_model, gpt->batch_size * gpt->seq_len,
                 1.0f, gpt->grad_output, gpt->vocab_size,
-                gpt->norm_output, gpt->d_model,
+                gpt->transformer->final_norm_output, gpt->d_model,
                 1.0f, gpt->token_embedding_grad, gpt->d_model);
     
-    // grad_norm_output = grad_output * token_embedding
+    // grad_final_norm_output = grad_output * token_embedding
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                 gpt->batch_size * gpt->seq_len, gpt->d_model, gpt->vocab_size,
                 1.0f, gpt->grad_output, gpt->vocab_size,
                 gpt->token_embedding, gpt->d_model,
-                0.0f, gpt->grad_norm_output, gpt->d_model);
-    
-    // Step 3 (backward): Backward pass through RMSNorm
-    rmsnorm_backward_gpt(gpt->transformer->mlp_layers[gpt->num_layers-1]->grad_output,
-                         gpt->grad_norm_output,
-                         gpt->transformer->mlp_layers[gpt->num_layers-1]->output,
-                         gpt->batch_size,
-                         gpt->seq_len,
-                         gpt->d_model);
+                0.0f, gpt->transformer->final_norm_output, gpt->d_model);
     
     // Step 2 (backward): Backward pass through transformer
     backward_pass_transformer(gpt->transformer, gpt->embedded_input, gpt->embedded_input);
