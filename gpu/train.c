@@ -121,7 +121,7 @@ int main(int argc, char* argv[]) {
         gpt = init_gpt(seq_len, d_model, hidden_dim, num_layers, batch_size, cublaslt_handle);
     }
     
-    printf("Parameters: ~%.1fM\n", (float)(gpt->vocab_size * d_model + num_layers * ((size_t)4 * d_model * d_model + d_model * hidden_dim + hidden_dim * d_model)) / 1e6f);
+    printf("Parameters: ~%.1fM\n", (float)(gpt->vocab_size * gpt->d_model + gpt->transformer->num_layers * ((size_t)4 * gpt->d_model * gpt->d_model + gpt->d_model * gpt->transformer->mlp_layers[0]->hidden_dim + gpt->transformer->mlp_layers[0]->hidden_dim * gpt->d_model)) / 1e6f);
     
     // Create shuffled indices for random sampling without replacement
     size_t total_sequences = (get_file_size(corpus_path) - 2) / (2 * seq_len);
