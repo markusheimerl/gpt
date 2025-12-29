@@ -33,6 +33,9 @@ run: train.out
 cont: train.out
 	@time ./train.out ../corpus.txt $$(ls -t *_gpt.bin 2>/dev/null | head -n1)
 
+finetune: train.out
+	@time ./train.out ../corpus_finetune.txt $$(ls -t *_gpt.bin 2>/dev/null | head -n1)
+
 clean:
 	rm -f *.out *.o *.csv
 	$(MAKE) -C ../transformer/gpu clean
