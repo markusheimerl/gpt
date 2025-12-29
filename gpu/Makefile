@@ -28,10 +28,10 @@ train.o: train.c gpt.h ../data.h
 	$(CC) $(CFLAGS) $(CUDAFLAGS) -c train.c -o $@
 
 run: train.out
-	@time ./train.out
+	@time ./train.out ../corpus.txt
 
 cont: train.out
-	@time ./train.out $$(ls -t *_gpt.bin 2>/dev/null | head -n1)
+	@time ./train.out ../corpus.txt $$(ls -t *_gpt.bin 2>/dev/null | head -n1)
 
 clean:
 	rm -f *.out *.o *.csv

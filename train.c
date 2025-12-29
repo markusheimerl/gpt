@@ -82,6 +82,9 @@ void generate_text(GPT* gpt, float temperature, const char* bos, int gen_len) {
 }
 
 int main(int argc, char* argv[]) {
+    const char* corpus_path = argv[1];
+    const char* checkpoint_path = (argc > 2) ? argv[2] : NULL;
+    
     srand(time(NULL));
     signal(SIGINT, handle_sigint);
     openblas_set_num_threads(4);
@@ -95,8 +98,8 @@ int main(int argc, char* argv[]) {
     const float learning_rate = 0.0001f;
     
     // Initialize or load model
-    if (argc > 1) {
-        gpt = load_gpt(argv[1], batch_size, seq_len);
+    if (checkpoint_path) {
+        gpt = load_gpt(checkpoint_path, batch_size, seq_len);
     } else {
         gpt = init_gpt(seq_len, d_model, hidden_dim, num_layers, batch_size);
     }
@@ -104,7 +107,7 @@ int main(int argc, char* argv[]) {
     printf("Parameters: ~%.1fM\n", (float)(gpt->vocab_size * d_model + num_layers * (4 * d_model * d_model + d_model * hidden_dim + hidden_dim * d_model)) / 1e6f);
     
     // Create shuffled indices for random sampling without replacement
-    size_t total_sequences = (get_file_size("corpus.txt") - 2) / (2 * seq_len);
+    size_t total_sequences = (get_file_size(corpus_path) - 2) / (2 * seq_len);
     size_t* shuffled_indices = create_shuffled_indices(total_sequences);
     
     // Allocate buffers for sequences
@@ -115,7 +118,7 @@ int main(int argc, char* argv[]) {
     // Training loop: process corpus in chunks with random sampling
     for (size_t chunk_idx = 0; chunk_idx < total_sequences / sequences_per_chunk; chunk_idx++) {
         // Sample next chunk of sequences from shuffled corpus
-        sample_sequences("corpus.txt", &shuffled_indices[chunk_idx * sequences_per_chunk], seq_len, input_tokens, target_tokens, sequences_per_chunk);
+        sample_sequences(corpus_path, &shuffled_indices[chunk_idx * sequences_per_chunk], seq_len, input_tokens, target_tokens, sequences_per_chunk);
         
         // Train on all batches in this chunk
         for (int batch = 0; batch < (int)(sequences_per_chunk / batch_size); batch++) {
