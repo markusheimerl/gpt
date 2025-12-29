@@ -95,12 +95,13 @@ int main(int argc, char* argv[]) {
     const int batch_size = 16;
     const int d_model = num_layers * 64;
     const int hidden_dim = d_model * 4;
-    const float learning_rate = 0.0001f;
+    float learning_rate = 0.0001f;
     
     // Initialize or load model
     if (checkpoint_path) {
         gpt = load_gpt(checkpoint_path, batch_size, seq_len);
         reset_optimizer_gpt(gpt);
+        learning_rate *= 0.1f;
     } else {
         gpt = init_gpt(seq_len, d_model, hidden_dim, num_layers, batch_size);
     }
