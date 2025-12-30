@@ -1,0 +1,189 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <math.h>
+#include <signal.h>
+#include <cblas.h>
+#include "gpt.h"
+
+static GPT* global_gpt = NULL;
+static unsigned short* global_tokens = NULL;
+static float* global_logits = NULL;
+
+void cleanup_and_exit(int signum) {
+    (void)signum;
+    printf("\n\nExiting...\n");
+    
+    // Cleanup
+    if (global_tokens) free(global_tokens);
+    if (global_logits) free(global_logits);
+    if (global_gpt) free_gpt(global_gpt);
+    
+    exit(0);
+}
+
+void generate_response(GPT* gpt, const char* question, unsigned short* tokens, float* logits) {
+    const int seq_len = gpt->seq_len;
+    
+    // Build the prompt
+    char prompt[4096];
+    snprintf(prompt, sizeof(prompt), "<|bos|><|user_start|>%s<|user_end|><|assistant_start|>", question);
+    size_t prompt_len = strlen(prompt);
+    int prompt_token_count = (prompt_len + 1) / 2;
+    
+    // Clear token buffer
+    memset(tokens, 0, seq_len * sizeof(unsigned short));
+    
+    // Encode prompt into tokens
+    for (int i = 0; i < prompt_token_count; i++) {
+        tokens[i] = (unsigned short)((unsigned char)prompt[i * 2] << 8) | 
+                    ((size_t)(i * 2 + 1) < prompt_len ? (unsigned char)prompt[i * 2 + 1] : ' ');
+    }
+    
+    const float temperature = 0.7f;
+    const int max_new_tokens = 256;
+    const char* end_marker = "<|assistant_end|>";
+    const size_t end_marker_len = strlen(end_marker);
+    
+    // Buffer for generated text (to check for end marker before printing)
+    char output_buffer[2048];
+    int output_len = 0;
+    int printed_len = 0;
+    
+    // Generate tokens
+    int pos_start = prompt_token_count - 1;
+    int done = 0;
+    
+    for (int pos = pos_start; pos < pos_start + max_new_tokens && pos < seq_len - 1 && !done; pos++) {
+        // Forward pass
+        forward_pass_gpt(gpt, tokens);
+        
+        // Get logits for current position
+        memcpy(logits, &gpt->output[pos * gpt->vocab_size], gpt->vocab_size * sizeof(float));
+        
+        // Apply temperature and find max
+        float max_logit = -1e30f;
+        for (int v = 0; v < gpt->vocab_size; v++) {
+            logits[v] /= temperature;
+            if (logits[v] > max_logit) max_logit = logits[v];
+        }
+        
+        // Softmax
+        float sum_exp = 0.0f;
+        for (int v = 0; v < gpt->vocab_size; v++) {
+            logits[v] = expf(logits[v] - max_logit);
+            sum_exp += logits[v];
+        }
+        
+        // Sample
+        float r = (float)rand() / (float)RAND_MAX;
+        unsigned short next_token = 0;
+        float cumsum = 0.0f;
+        for (int v = 0; v < gpt->vocab_size; v++) {
+            cumsum += logits[v] / sum_exp;
+            if (r <= cumsum) {
+                next_token = v;
+                break;
+            }
+        }
+        
+        tokens[pos + 1] = next_token;
+        
+        // Add to output buffer
+        if (output_len < (int)sizeof(output_buffer) - 3) {
+            output_buffer[output_len++] = (char)(next_token >> 8);
+            output_buffer[output_len++] = (char)(next_token & 0xFF);
+            output_buffer[output_len] = '\0';
+        }
+        
+        // Check if we have the end marker in our buffer
+        char* marker_pos = strstr(output_buffer, end_marker);
+        if (marker_pos) {
+            // Found end marker - print everything up to it
+            int pos_in_buffer = marker_pos - output_buffer;
+            while (printed_len < pos_in_buffer) {
+                putchar(output_buffer[printed_len]);
+                printed_len++;
+            }
+            done = 1;
+            break;
+        }
+        
+        // Print any complete characters that are safe (not potentially part of end marker)
+        // Keep at least end_marker_len characters in buffer to check for end marker
+        while (printed_len < output_len - (int)end_marker_len && printed_len < output_len) {
+            putchar(output_buffer[printed_len]);
+            fflush(stdout);
+            printed_len++;
+        }
+    }
+    
+    // Print any remaining characters if we didn't find the end marker
+    if (!done) {
+        while (printed_len < output_len) {
+            putchar(output_buffer[printed_len]);
+            printed_len++;
+        }
+    }
+    
+    printf("\n");
+}
+
+int main(int argc, char* argv[]) {
+    srand(time(NULL));
+    signal(SIGINT, cleanup_and_exit);
+    openblas_set_num_threads(4);
+    
+    // Determine model file
+    const char* model_file = NULL;
+    
+    if (argc > 1) {
+        // Model file provided via command line
+        model_file = argv[1];
+    } else {
+        fprintf(stderr, "Usage: %s <model_file.bin>\n", argv[0]);
+        return 1;
+    }
+    
+    // Load model with batch_size=1 for inference
+    const int seq_len = 512;
+    printf("Loading model from %s...\n", model_file);
+    global_gpt = load_gpt(model_file, 1, seq_len);
+    if (!global_gpt) {
+        fprintf(stderr, "Failed to load model\n");
+        return 1;
+    }
+    printf("Model loaded. Ready!\n");
+    
+    // Allocate buffers once
+    global_tokens = (unsigned short*)calloc(seq_len, sizeof(unsigned short));
+    global_logits = (float*)malloc(global_gpt->vocab_size * sizeof(float));
+    
+    // Interactive mode
+    char question[4096];
+    
+    while (1) {
+        printf("\n\033[1;36m?\033[0m ");
+        fflush(stdout);
+        
+        if (!fgets(question, sizeof(question), stdin)) {
+            break;  // EOF or error
+        }
+        
+        // Remove newline
+        question[strcspn(question, "\n")] = 0;
+        
+        // Skip empty questions
+        if (strlen(question) == 0) continue;
+        
+        printf("\033[1;32m>\033[0m ");
+        fflush(stdout);
+        
+        generate_response(global_gpt, question, global_tokens, global_logits);
+    }
+    
+    // Normal cleanup
+    cleanup_and_exit(0);
+    return 0;
+}
