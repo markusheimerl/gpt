@@ -133,7 +133,7 @@ void generate_response(GPT* gpt, const char* question, unsigned short* tokens, f
 int main(int argc, char* argv[]) {
     srand(time(NULL));
     signal(SIGINT, cleanup_and_exit);
-    openblas_set_num_threads(4);
+    openblas_set_num_threads(8);
     
     // Determine model file
     const char* model_file = NULL;
@@ -147,7 +147,7 @@ int main(int argc, char* argv[]) {
     }
     
     // Load model with batch_size=1 for inference
-    const int seq_len = 512;
+    const int seq_len = 128;
     printf("Loading model from %s...\n", model_file);
     global_gpt = load_gpt(model_file, 1, seq_len);
     if (!global_gpt) {

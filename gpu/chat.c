@@ -159,7 +159,7 @@ int main(int argc, char* argv[]) {
     }
     
     // Load model with batch_size=1 for inference
-    const int seq_len = 512;
+    const int seq_len = 128;
     printf("Loading model from %s...\n", model_file);
     global_gpt = load_gpt(model_file, 1, seq_len, global_handle);
     if (!global_gpt) {
