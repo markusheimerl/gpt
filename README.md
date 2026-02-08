@@ -18,5 +18,5 @@ The implementation uses BLAS (Basic Linear Algebra Subprograms) for efficient ma
 sudo apt update && sudo apt install clang time libopenblas-dev && python3 -m pip install datasets
 git clone https://github.com/markusheimerl/gpt && cd gpt/
 python3 get_corpus.py
-make run -j 4
+make run -j 6
 ```

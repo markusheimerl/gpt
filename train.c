@@ -156,12 +156,13 @@ int main(int argc, char* argv[]) {
     CHECK_CUBLASLT(cublasLtCreate(&cublaslt_handle));
 
     // Model hyperparameters
-    const int seq_len = 512;
+    const int seq_len = 1024;
     const int num_layers = 21;
-    const int batch_size = 22;
+    const int batch_size = 8;
     const int d_model = num_layers * 64;
     const int hidden_dim = d_model * 4;
     float learning_rate = 0.0001f;
+    const int accum_steps = 4;
     
     // Initialize or load model
     if (checkpoint_path) {
@@ -209,20 +210,22 @@ int main(int argc, char* argv[]) {
             if (loss >= 12.0) raise(SIGINT);
             
             // Backward pass
-            zero_gradients_gpt(gpt);
+            if (batch % accum_steps == 0) zero_gradients_gpt(gpt);
             backward_pass_gpt(gpt, d_input_tokens);
             
             // Update weights with cosine learning rate schedule
-            float lr = learning_rate * fminf(1.0f, (float)(chunk_idx * (sequences_per_chunk / batch_size) + batch) / 1000.0f) * (0.1f + 0.45f * (1.0f + cosf(M_PI * ((float)(chunk_idx * (sequences_per_chunk / batch_size) + batch) / (float)(total_sequences / batch_size)))));
-            update_weights_gpt(gpt, lr, batch_size);
-            
-            CHECK_CUDA(cudaDeviceSynchronize()); struct timespec end; clock_gettime(CLOCK_MONOTONIC, &end);
-            printf("Chunk [%zu/%zu], Batch [%d/%d], Loss: %.6f, LR: %.7f, dt: %.2fms, tok/s: %.0f, bpb: %.4f, ETA: %.1fh\n",
-                   chunk_idx, total_sequences / sequences_per_chunk, batch, (int)(sequences_per_chunk / batch_size),
-                   loss, lr, ((end.tv_sec - start.tv_sec) * 1000.0 + (end.tv_nsec - start.tv_nsec) / 1e6),
-                   (batch_size * seq_len) / ((end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9),
-                   loss / log(2.0) / 2.0,
-                   ((double)total_sequences / batch_size - (chunk_idx * (sequences_per_chunk / batch_size) + batch) - 1) * ((end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9) / 3600.0);
+            if ((batch + 1) % accum_steps == 0) {
+                float lr = learning_rate * fminf(1.0f, (float)(chunk_idx * (sequences_per_chunk / batch_size) + batch) / 1000.0f) * (0.1f + 0.45f * (1.0f + cosf(M_PI * ((float)(chunk_idx * (sequences_per_chunk / batch_size) + batch) / (float)(total_sequences / batch_size)))));
+                update_weights_gpt(gpt, lr, batch_size * accum_steps);
+
+                CHECK_CUDA(cudaDeviceSynchronize()); struct timespec end; clock_gettime(CLOCK_MONOTONIC, &end);
+                printf("Chunk [%zu/%zu], Batch [%d/%d], Loss: %.6f, LR: %.7f, dt: %.2fms, tok/s: %.0f, bpb: %.4f, ETA: %.1fh\n",
+                    chunk_idx, total_sequences / sequences_per_chunk, batch, (int)(sequences_per_chunk / batch_size),
+                    loss, lr, ((end.tv_sec - start.tv_sec) * 1000.0 + (end.tv_nsec - start.tv_nsec) / 1e6),
+                    (batch_size * seq_len) / ((end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9),
+                    loss / log(2.0) / 2.0,
+                    ((double)total_sequences / batch_size - (chunk_idx * (sequences_per_chunk / batch_size) + batch) - 1) * ((end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9) / 3600.0);
+            }
         }
         
         // Generate sample text
