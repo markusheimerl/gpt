@@ -189,13 +189,30 @@ int main(int argc, char* argv[]) {
     CHECK_CUDA(cudaMalloc(&d_input_tokens, batch_size * seq_len * sizeof(unsigned short)));
     CHECK_CUDA(cudaMalloc(&d_target_tokens, batch_size * seq_len * sizeof(unsigned short)));
     
+    // Calculate starting position based on training progress
+    size_t start_chunk = 0;
+    int start_batch = 0;
+
+    if (checkpoint_path && ((size_t)gpt->t * accum_steps) > 0) {
+        start_chunk = ((size_t)gpt->t * accum_steps) / (sequences_per_chunk / batch_size);
+        start_batch = (int)(((size_t)gpt->t * accum_steps) % (sequences_per_chunk / batch_size));
+        if (start_chunk >= (total_sequences / sequences_per_chunk)) {
+            start_chunk = (total_sequences / sequences_per_chunk);
+            start_batch = 0;
+        }
+        printf("Resuming from batch %zu (chunk %zu, batch %d)\n", ((size_t)gpt->t * accum_steps), start_chunk, start_batch);
+    }
+
     // Training loop: process corpus in chunks with random sampling
-    for (size_t chunk_idx = 0; chunk_idx < total_sequences / sequences_per_chunk; chunk_idx++) {
+    for (size_t chunk_idx = start_chunk; chunk_idx < (total_sequences / sequences_per_chunk); chunk_idx++) {
         // Sample next chunk of sequences from shuffled corpus
         sample_sequences(corpus_path, &shuffled_indices[chunk_idx * sequences_per_chunk], seq_len, input_tokens, target_tokens, sequences_per_chunk);
         
+        // Determine starting batch for this chunk
+        int batch_start = (chunk_idx == start_chunk) ? start_batch : 0;
+
         // Train on all batches in this chunk
-        for (int batch = 0; batch < (int)(sequences_per_chunk / batch_size); batch++) {
+        for (int batch = batch_start; batch < (int)(sequences_per_chunk / batch_size); batch++) {
             struct timespec start; clock_gettime(CLOCK_MONOTONIC, &start);
             
             // Copy batch to device
