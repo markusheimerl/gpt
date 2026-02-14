@@ -1,6 +1,8 @@
 from datasets import load_dataset
+from huggingface_hub import login
+login()
 
-TOTAL_SIZE_GB = 22
+TOTAL_SIZE_GB = 50
 OUTPUT_FILE = "corpus.txt"
 SOURCES = {
     "finePDFs":      ("HuggingFaceFW/finepdfs",          {},                     0.50, 789054),
