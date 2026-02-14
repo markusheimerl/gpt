@@ -1,10 +1,10 @@
 CC = clang
-CFLAGS = -O3 -march=native -ffast-math -Wall -Wextra
+CFLAGS = -O3 -march=native -ffast-math -Wall -Wextra -Wno-unknown-cuda-version
 LDFLAGS = -lopenblas -lm -flto
 
 ARCH ?= sm_86
-CUDAFLAGS = --cuda-gpu-arch=$(ARCH) -x cuda
-CUDALIBS = -L/usr/local/cuda/lib64 -lcudart -lcublasLt
+CUDAFLAGS = --cuda-path=/opt/cuda --cuda-path=/opt/cuda --cuda-gpu-arch=$(ARCH) -x cuda
+CUDALIBS = -L/opt/cuda/lib64 -lcudart -lcublasLt
 
 train.out: gpt.o transformer/transformer.o transformer/attention/attention.o transformer/mlp/mlp.o train.o
 	$(CC) gpt.o transformer/transformer.o transformer/attention/attention.o transformer/mlp/mlp.o train.o $(CUDALIBS) $(LDFLAGS) -o $@

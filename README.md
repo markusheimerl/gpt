@@ -15,7 +15,9 @@ The implementation uses BLAS (Basic Linear Algebra Subprograms) for efficient ma
 
 ## How to run
 ```bash
-sudo apt update && sudo apt install clang time libopenblas-dev && python3 -m pip install datasets
+sudo pacman -S clang make time openblas
+sudo pacman -Udd https://archive.archlinux.org/packages/c/cuda/cuda-12.8.1-1-x86_64.pkg.tar.zst
+python3 -m pip install datasets
 git clone https://github.com/markusheimerl/gpt && cd gpt/
 python3 get_corpus.py
 make run -j 6
