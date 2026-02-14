@@ -71,74 +71,74 @@ void handle_sigint(int signum) {
     exit(128 + signum);
 }
 
-// Generate text autoregressively from a prompt
-void generate_text(GPT* gpt, float temperature, unsigned short* d_input_tokens, const char* bos, int gen_len) {
-    // Start with zero-initialized sequence
+void generate_text(GPT* gpt, float temperature, unsigned short* d_input_tokens, 
+                   const char* prompt, int gen_len) {
+    // Encode prompt via spm_encode
+    char cmd[2048];
+    snprintf(cmd, sizeof(cmd), 
+             "echo '%s' | ./sentencepiece/build/src/spm_encode "
+             "--model=./sentencepiece/spm_custom.model --output_format=id", 
+             prompt);
+    
+    FILE* fp = popen(cmd, "r");
+    if (!fp) { fprintf(stderr, "Failed to encode\n"); return; }
+    
     unsigned short* h_tokens = (unsigned short*)calloc(gpt->seq_len, sizeof(unsigned short));
+    int prompt_len = 0;
+    while (fscanf(fp, "%hu", &h_tokens[prompt_len]) == 1 && prompt_len < gpt->seq_len)
+        prompt_len++;
+    pclose(fp);
     
-    // Set beginning of sequence (prompt)
-    for (int i = 0; i < (int)(strlen(bos) + 1) / 2; i++) {
-        h_tokens[i] = (unsigned short)((unsigned char)bos[i * 2] << 8) | ((unsigned long)(i * 2 + 1) < strlen(bos) ? (unsigned char)bos[i * 2 + 1] : ' ');
-    }
-    
-    printf("\"%s%s", bos, (strlen(bos) % 2) ? " " : "");
-    fflush(stdout);
+    if (prompt_len == 0) { free(h_tokens); return; }
     
     float* h_logits = (float*)malloc(gpt->vocab_size * sizeof(float));
     half* h_logits_half = (half*)malloc(gpt->vocab_size * sizeof(half));
     
-    // Generate tokens one at a time
-    for (int pos = (strlen(bos) + 1) / 2 - 1; pos < gen_len; pos++) {
-        // Copy current sequence to device
-        CHECK_CUDA(cudaMemcpy(d_input_tokens, h_tokens, gpt->seq_len * sizeof(unsigned short), cudaMemcpyHostToDevice));
-        
-        // Forward pass to get logits
+    for (int pos = prompt_len - 1; pos < gen_len && pos < gpt->seq_len - 1; pos++) {
+        CHECK_CUDA(cudaMemcpy(d_input_tokens, h_tokens, 
+                   gpt->seq_len * sizeof(unsigned short), cudaMemcpyHostToDevice));
         forward_pass_gpt(gpt, d_input_tokens);
+        CHECK_CUDA(cudaMemcpy(h_logits_half, &gpt->d_output[pos * gpt->vocab_size], 
+                   gpt->vocab_size * sizeof(half), cudaMemcpyDeviceToHost));
         
-        // Copy logits for current position back to host
-        CHECK_CUDA(cudaMemcpy(h_logits_half, &gpt->d_output[pos * gpt->vocab_size], gpt->vocab_size * sizeof(half), cudaMemcpyDeviceToHost));
-        
-        // Convert to float
-        for (int v = 0; v < gpt->vocab_size; v++) {
-            h_logits[v] = __half2float(h_logits_half[v]);
-        }
-        
-        // Apply temperature scaling and find max for numerical stability
         float max_logit = -1e30f;
         for (int v = 0; v < gpt->vocab_size; v++) {
-            h_logits[v] /= temperature;
+            h_logits[v] = __half2float(h_logits_half[v]) / temperature;
             if (h_logits[v] > max_logit) max_logit = h_logits[v];
         }
-        
-        // Compute softmax probabilities
         float sum_exp = 0.0f;
         for (int v = 0; v < gpt->vocab_size; v++) {
             h_logits[v] = expf(h_logits[v] - max_logit);
             sum_exp += h_logits[v];
         }
-        for (int v = 0; v < gpt->vocab_size; v++) {
-            h_logits[v] /= sum_exp;
-        }
+        for (int v = 0; v < gpt->vocab_size; v++) h_logits[v] /= sum_exp;
         
-        // Sample from the distribution
         float r = (float)rand() / (float)RAND_MAX;
         unsigned short next_token = 0;
         float cumsum = 0.0f;
         for (int v = 0; v < gpt->vocab_size; v++) {
             cumsum += h_logits[v];
-            if (r <= cumsum) {
-                next_token = v;
-                break;
-            }
+            if (r <= cumsum) { next_token = v; break; }
         }
-        
-        // Add sampled token to sequence
         h_tokens[pos + 1] = next_token;
-        printf("%c%c", (char)(next_token >> 8), (char)(next_token & 0xFF));
-        fflush(stdout);
     }
     
-    printf("\"\n");
+    // Decode via spm_decode
+    char temp[] = "/tmp/gpt_XXXXXX";
+    int fd = mkstemp(temp);
+    FILE* tf = fdopen(fd, "w");
+    for (int i = 0; i < gen_len && i < gpt->seq_len; i++)
+        fprintf(tf, "%hu ", h_tokens[i]);
+    fclose(tf);
+    
+    char dcmd[512];
+    snprintf(dcmd, sizeof(dcmd),
+             "printf '\"' && ./sentencepiece/build/src/spm_decode "
+             "--model=./sentencepiece/spm_custom.model --input_format=id < %s "
+             "&& printf '\"\n'", temp);
+    system(dcmd);
+    unlink(temp);
+    
     free(h_tokens);
     free(h_logits);
     free(h_logits_half);
