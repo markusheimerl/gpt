@@ -5,10 +5,10 @@ login()
 TOTAL_SIZE_GB = 50
 OUTPUT_FILE = "corpus.txt"
 SOURCES = {
-    "finePDFs":      ("HuggingFaceFW/finepdfs",          {},                     0.50, 789054),
-    "DCLM-baseline": ("mlfoundations/dclm-baseline-1.0", {},                     0.20, 970567),
-    "FineWeb-Edu":   ("HuggingFaceFW/fineweb-edu",       {"name": "sample-10BT"},0.20, 231489),
-    "LMSYS-Chat":    ("lmsys/lmsys-chat-1m",             {},                     0.10, 452387),
+    "finePDFs":      ("HuggingFaceFW/finepdfs",          {},                     0.50, 2341667),
+    "DCLM-baseline": ("mlfoundations/dclm-baseline-1.0", {},                     0.20, 4922678),
+    "FineWeb-Edu":   ("HuggingFaceFW/fineweb-edu",       {"name": "sample-10BT"},0.20, 8865235),
+    "LMSYS-Chat":    ("lmsys/lmsys-chat-1m",             {},                     0.10, 7746375),
 }
 
 def format_example(example):
