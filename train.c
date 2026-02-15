@@ -326,7 +326,7 @@ int main(int argc, char* argv[]) {
 
                 CHECK_CUDA(cudaDeviceSynchronize()); struct timespec end; clock_gettime(CLOCK_MONOTONIC, &end);
                 printf("Chunk [%zu/%zu], Batch [%d/%d], Loss: %.6f, LR: %.7f, dt: %.2fms, tok/s: %.0f, bpb: %.4f, ETA: %.1fh\n",
-                    chunk_idx, total_chunks, batch, (int)(sequences_per_chunk / batch_size),
+                    chunk_idx, total_chunks, batch, (int)(num_sequences / batch_size),
                     loss, lr, ((end.tv_sec - start.tv_sec) * 1000.0 + (end.tv_nsec - start.tv_nsec) / 1e6),
                     (batch_size * seq_len) / ((end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9),
                     loss / log(2.0) / 2.0,
