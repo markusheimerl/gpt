@@ -1,5 +1,8 @@
 from datasets import load_dataset
 from huggingface_hub import login
+import psutil
+import gc
+
 login()
 
 TOTAL_SIZE_GB = 50
@@ -18,6 +21,9 @@ def format_example(example):
         body = example["text"]
     return f"<|bos|>{body}\n"
 
+def get_memory_gb():
+    return psutil.Process().memory_info().rss / 1024**3
+
 def main():
     targets = {n: r * TOTAL_SIZE_GB * 1024**3 for n, (_, _, r, _) in SOURCES.items()}
     sizes = dict.fromkeys(SOURCES, 0)
@@ -28,8 +34,7 @@ def main():
         print(f"  {n}: {targets[n]/1024**3:.1f} GB ({SOURCES[n][2]:.0%})")
 
     iterators = {
-        n: iter(load_dataset(path, split="train", streaming=True, **kw)
-                .shuffle(seed=seed, buffer_size=10000))
+        n: iter(load_dataset(path, split="train", streaming=True, **kw).shuffle(seed=seed, buffer_size=500))
         for n, (path, kw, _, seed) in SOURCES.items()
     }
 
@@ -54,7 +59,10 @@ def main():
             if sum(counts.values()) % 1000 == 0:
                 total = sum(sizes.values())
                 parts = " | ".join(f"{n}: {sizes[n]/1024**3:.2f}GB" for n in SOURCES)
-                print(f"{sum(counts.values()):,} docs | {parts} | total: {total/1024**3:.2f}GB")
+                print(f"{sum(counts.values()):,} docs | {parts} | total: {total/1024**3:.2f}GB | RAM: {get_memory_gb():.1f}GB")
+                if get_memory_gb() > 12:
+                    f.flush()
+                    gc.collect()
 
     print(f"\n✓ Done!")
     for n in SOURCES:
