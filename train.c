@@ -18,95 +18,82 @@ size_t get_file_size(const char* filename) {
     return size;
 }
 
-// Tokenize text using SentencePiece and return token count
-size_t tokenize_text(const char* text, size_t text_len, unsigned short* tokens, size_t max_tokens) {
-    char temp_in[] = "/tmp/gpt_in_XXXXXX";
-    int fd_in = mkstemp(temp_in);
-    if (fd_in < 0) return 0;
-    
-    write(fd_in, text, text_len);
-    close(fd_in);
-    
+// Read next text chunk from open corpus file, tokenize via SentencePiece,
+// create non-overlapping input/target sequence pairs.
+// Returns number of complete sequences created.
+size_t read_tokenize_chunk(FILE* corpus, int seq_len, unsigned short* input_tokens,
+                           unsigned short* target_tokens, size_t max_sequences) {
+    // Read text: estimate ~4 text bytes per token
+    size_t text_buf_size = max_sequences * seq_len * 4;
+    char* text = (char*)malloc(text_buf_size);
+    if (!text) return 0;
+
+    size_t n = fread(text, 1, text_buf_size, corpus);
+    if (n == 0) { free(text); return 0; }
+
+    // Back up to last newline so we don't split a line mid-document
+    size_t orig_n = n;
+    while (n > 0 && text[n - 1] != '\n') n--;
+    if (n == 0) n = orig_n;
+    else fseek(corpus, -(long)(orig_n - n), SEEK_CUR);
+
+    // Write text to temp file for spm_encode
+    char tmp[] = "/tmp/gpt_tok_XXXXXX";
+    int fd = mkstemp(tmp);
+    if (fd < 0) { free(text); return 0; }
+    FILE* tmp_fp = fdopen(fd, "w");
+    fwrite(text, 1, n, tmp_fp);
+    fclose(tmp_fp);
+    free(text);
+
+    // Run spm_encode to get token IDs
     char cmd[512];
     snprintf(cmd, sizeof(cmd),
              "./sentencepiece/build/src/spm_encode "
-             "--model=./sentencepiece/spm_custom.model --output_format=id < %s",
-             temp_in);
-    
+             "--model=./sentencepiece/spm_custom.model --output_format=id < %s", tmp);
     FILE* fp = popen(cmd, "r");
-    if (!fp) {
-        unlink(temp_in);
-        return 0;
-    }
-    
-    size_t count = 0;
-    while (count < max_tokens && fscanf(fp, "%hu", &tokens[count]) == 1) {
-        count++;
-    }
-    
+    if (!fp) { unlink(tmp); return 0; }
+
+    size_t max_tokens = max_sequences * (seq_len + 1);
+    unsigned short* tokens = (unsigned short*)malloc(max_tokens * sizeof(unsigned short));
+    size_t num_tokens = 0;
+    while (num_tokens < max_tokens && fscanf(fp, "%hu", &tokens[num_tokens]) == 1)
+        num_tokens++;
     pclose(fp);
-    unlink(temp_in);
-    
-    return count;
+    unlink(tmp);
+
+    // Create non-overlapping input[i..i+seq_len-1] / target[i+1..i+seq_len] pairs
+    size_t num_seq = 0;
+    for (size_t i = 0; i + seq_len < num_tokens && num_seq < max_sequences; i += seq_len) {
+        memcpy(&input_tokens[num_seq * seq_len], &tokens[i], seq_len * sizeof(unsigned short));
+        memcpy(&target_tokens[num_seq * seq_len], &tokens[i + 1], seq_len * sizeof(unsigned short));
+        num_seq++;
+    }
+
+    printf("  %zu text bytes -> %zu tokens -> %zu sequences (%.2f tok/byte)\n",
+           n, num_tokens, num_seq, (double)num_tokens / n);
+
+    free(tokens);
+    return num_seq;
 }
 
-// Create shuffled sequence indices for entire corpus
-size_t* create_shuffled_indices(size_t total_sequences) {
-    size_t* indices = (size_t*)malloc(total_sequences * sizeof(size_t));
-    
-    // Initialize sequentially
-    for (size_t i = 0; i < total_sequences; i++) {
-        indices[i] = i;
-    }
-    
-    // Fisher-Yates shuffle
-    for (size_t i = total_sequences - 1; i > 0; i--) {
+// Shuffle sequence pairs in-place (Fisher-Yates)
+void shuffle_sequences(unsigned short* input_tokens, unsigned short* target_tokens,
+                       size_t num_sequences, int seq_len) {
+    size_t row_bytes = seq_len * sizeof(unsigned short);
+    unsigned short* tmp = (unsigned short*)malloc(row_bytes);
+    for (size_t i = num_sequences - 1; i > 0; i--) {
         size_t j = rand() % (i + 1);
-        size_t temp = indices[i];
-        indices[i] = indices[j];
-        indices[j] = temp;
+        if (i != j) {
+            memcpy(tmp, &input_tokens[i * seq_len], row_bytes);
+            memcpy(&input_tokens[i * seq_len], &input_tokens[j * seq_len], row_bytes);
+            memcpy(&input_tokens[j * seq_len], tmp, row_bytes);
+            memcpy(tmp, &target_tokens[i * seq_len], row_bytes);
+            memcpy(&target_tokens[i * seq_len], &target_tokens[j * seq_len], row_bytes);
+            memcpy(&target_tokens[j * seq_len], tmp, row_bytes);
+        }
     }
-    
-    return indices;
-}
-
-// Sample sequences using shuffled indices
-void sample_sequences(const char* filename, size_t* indices, int seq_len, unsigned short* input_tokens, unsigned short* target_tokens, size_t num_sequences) {
-    FILE* f = fopen(filename, "r");
-    if (!f) return;
-    
-    // Read text chunk (estimate ~4 bytes per token in source text)
-    size_t text_chunk_size = num_sequences * seq_len * 4;
-    char* text_buffer = (char*)malloc(text_chunk_size);
-    
-    // Seek to approximate position based on first index
-    if (num_sequences > 0 && indices[0] > 0) {
-        fseek(f, indices[0] * seq_len * 4, SEEK_SET);
-    }
-    
-    size_t bytes_read = fread(text_buffer, 1, text_chunk_size, f);
-    fclose(f);
-    
-    if (bytes_read == 0) {
-        free(text_buffer);
-        return;
-    }
-    
-    // Tokenize the chunk
-    size_t max_tokens = num_sequences * (seq_len + 1);
-    unsigned short* all_tokens = (unsigned short*)malloc(max_tokens * sizeof(unsigned short));
-    size_t num_tokens = tokenize_text(text_buffer, bytes_read, all_tokens, max_tokens);
-    free(text_buffer);
-    
-    // Create input/target pairs from token stream
-    size_t seq_count = 0;
-    for (size_t i = 0; i + seq_len < num_tokens && seq_count < num_sequences; i += seq_len) {
-        memcpy(&input_tokens[seq_count * seq_len], &all_tokens[i], seq_len * sizeof(unsigned short));
-        memcpy(&target_tokens[seq_count * seq_len], &all_tokens[i + 1], seq_len * sizeof(unsigned short));
-        seq_count++;
-    }
-    
-    free(all_tokens);
+    free(tmp);
 }
 
 GPT* gpt = NULL;
@@ -124,44 +111,45 @@ void handle_sigint(int signum) {
 
 // Generate text autoregressively from a prompt
 void generate_text(GPT* gpt, float temperature, unsigned short* d_input_tokens, const char* prompt, int gen_len) {
-    // Encode prompt using SentencePiece
+    // Encode prompt via spm_encode
     char cmd[2048];
-    snprintf(cmd, sizeof(cmd), 
+    snprintf(cmd, sizeof(cmd),
              "echo '%s' | ./sentencepiece/build/src/spm_encode "
-             "--model=./sentencepiece/spm_custom.model --output_format=id", 
-             prompt);
-    
+             "--model=./sentencepiece/spm_custom.model --output_format=id", prompt);
+
     FILE* fp = popen(cmd, "r");
     if (!fp) return;
-    
+
     unsigned short* h_tokens = (unsigned short*)calloc(gpt->seq_len, sizeof(unsigned short));
     int prompt_len = 0;
     while (fscanf(fp, "%hu", &h_tokens[prompt_len]) == 1 && prompt_len < gpt->seq_len)
         prompt_len++;
     pclose(fp);
-    
-    if (prompt_len == 0) {
-        free(h_tokens);
-        return;
-    }
-    
+
+    if (prompt_len == 0) { free(h_tokens); return; }
+
     float* h_logits = (float*)malloc(gpt->vocab_size * sizeof(float));
     half* h_logits_half = (half*)malloc(gpt->vocab_size * sizeof(half));
-    
+
     // Generate tokens one at a time
     for (int pos = prompt_len - 1; pos < gen_len && pos < gpt->seq_len - 1; pos++) {
-        CHECK_CUDA(cudaMemcpy(d_input_tokens, h_tokens, 
-                   gpt->seq_len * sizeof(unsigned short), cudaMemcpyHostToDevice));
+        // Copy current sequence to device
+        CHECK_CUDA(cudaMemcpy(d_input_tokens, h_tokens, gpt->seq_len * sizeof(unsigned short), cudaMemcpyHostToDevice));
+
+        // Forward pass to get logits
         forward_pass_gpt(gpt, d_input_tokens);
-        CHECK_CUDA(cudaMemcpy(h_logits_half, &gpt->d_output[pos * gpt->vocab_size], 
-                   gpt->vocab_size * sizeof(half), cudaMemcpyDeviceToHost));
-        
-        // Apply temperature and compute softmax
+
+        // Copy logits for current position back to host
+        CHECK_CUDA(cudaMemcpy(h_logits_half, &gpt->d_output[pos * gpt->vocab_size], gpt->vocab_size * sizeof(half), cudaMemcpyDeviceToHost));
+
+        // Apply temperature scaling and find max for numerical stability
         float max_logit = -1e30f;
         for (int v = 0; v < gpt->vocab_size; v++) {
             h_logits[v] = __half2float(h_logits_half[v]) / temperature;
             if (h_logits[v] > max_logit) max_logit = h_logits[v];
         }
+
+        // Compute softmax probabilities
         float sum_exp = 0.0f;
         for (int v = 0; v < gpt->vocab_size; v++) {
             h_logits[v] = expf(h_logits[v] - max_logit);
@@ -170,8 +158,8 @@ void generate_text(GPT* gpt, float temperature, unsigned short* d_input_tokens, 
         for (int v = 0; v < gpt->vocab_size; v++) {
             h_logits[v] /= sum_exp;
         }
-        
-        // Sample from distribution
+
+        // Sample from the distribution
         float r = (float)rand() / (float)RAND_MAX;
         unsigned short next_token = 0;
         float cumsum = 0.0f;
@@ -182,17 +170,19 @@ void generate_text(GPT* gpt, float temperature, unsigned short* d_input_tokens, 
                 break;
             }
         }
+
+        // Add sampled token to sequence
         h_tokens[pos + 1] = next_token;
     }
-    
-    // Decode using SentencePiece
+
+    // Decode all generated tokens via spm_decode
     char temp[] = "/tmp/gpt_XXXXXX";
     int fd = mkstemp(temp);
     FILE* tf = fdopen(fd, "w");
     for (int i = 0; i < gen_len && i < gpt->seq_len; i++)
         fprintf(tf, "%hu ", h_tokens[i]);
     fclose(tf);
-    
+
     char dcmd[512];
     snprintf(dcmd, sizeof(dcmd),
              "printf '\"' && ./sentencepiece/build/src/spm_decode "
@@ -200,7 +190,7 @@ void generate_text(GPT* gpt, float temperature, unsigned short* d_input_tokens, 
              "&& printf '\"\n'", temp);
     system(dcmd);
     unlink(temp);
-    
+
     free(h_tokens);
     free(h_logits);
     free(h_logits_half);
@@ -209,7 +199,7 @@ void generate_text(GPT* gpt, float temperature, unsigned short* d_input_tokens, 
 int main(int argc, char* argv[]) {
     const char* corpus_path = argv[1];
     const char* checkpoint_path = (argc > 2) ? argv[2] : NULL;
-    
+
     srand(time(NULL));
     signal(SIGINT, handle_sigint);
 
@@ -225,86 +215,104 @@ int main(int argc, char* argv[]) {
     const int hidden_dim = d_model * 4;
     float learning_rate = 0.0001f;
     const int accum_steps = 1;
-    
+
     // Initialize or load model
     if (checkpoint_path) {
         gpt = load_gpt(checkpoint_path, batch_size, seq_len, cublaslt_handle);
     } else {
         gpt = init_gpt(seq_len, d_model, hidden_dim, num_layers, batch_size, cublaslt_handle);
     }
-    
+
     printf("Parameters: ~%.1fM\n", (float)(gpt->vocab_size * gpt->d_model + gpt->transformer->num_layers * ((size_t)4 * gpt->d_model * gpt->d_model + gpt->d_model * gpt->transformer->mlp_layers[0]->hidden_dim + gpt->transformer->mlp_layers[0]->hidden_dim * gpt->d_model)) / 1e6f);
-    
-    // Create shuffled indices for random sampling without replacement
-    size_t total_sequences = (get_file_size(corpus_path) / 4) / seq_len;
-    size_t* shuffled_indices = create_shuffled_indices(total_sequences);
-    
+
+    // Estimate total batches from corpus size (~4 text bytes per token)
+    size_t corpus_size = get_file_size(corpus_path);
+    size_t estimated_total_batches = corpus_size / 4 / (batch_size * seq_len);
+
     // Allocate host buffers for sequences
     size_t sequences_per_chunk = (128 * 1024 * 1024) / (seq_len * 2);
     unsigned short* input_tokens = (unsigned short*)malloc(sequences_per_chunk * seq_len * sizeof(unsigned short));
     unsigned short* target_tokens = (unsigned short*)malloc(sequences_per_chunk * seq_len * sizeof(unsigned short));
-    
+
     // Allocate device buffers
     unsigned short *d_input_tokens, *d_target_tokens;
     CHECK_CUDA(cudaMalloc(&d_input_tokens, batch_size * seq_len * sizeof(unsigned short)));
     CHECK_CUDA(cudaMalloc(&d_target_tokens, batch_size * seq_len * sizeof(unsigned short)));
-    
-    // Calculate starting position based on training progress
-    size_t start_chunk = 0;
-    int start_batch = 0;
 
+    // Open corpus for sequential reading
+    FILE* corpus_file = fopen(corpus_path, "r");
+    if (!corpus_file) { fprintf(stderr, "Cannot open %s\n", corpus_path); return 1; }
+
+    size_t global_batch = 0;
+    size_t chunk_idx = 0;
+
+    // Calculate starting position based on training progress
     if (checkpoint_path && ((size_t)gpt->t * accum_steps) > 0) {
-        start_chunk = ((size_t)gpt->t * accum_steps) / (sequences_per_chunk / batch_size);
-        start_batch = (int)(((size_t)gpt->t * accum_steps) % (sequences_per_chunk / batch_size));
-        if (start_chunk >= (total_sequences / sequences_per_chunk)) {
-            start_chunk = (total_sequences / sequences_per_chunk);
-            start_batch = 0;
+        global_batch = (size_t)gpt->t * accum_steps;
+        size_t bytes_to_skip = global_batch * batch_size * seq_len * 4;
+        if (bytes_to_skip < corpus_size) {
+            fseek(corpus_file, bytes_to_skip, SEEK_SET);
+            chunk_idx = global_batch / (sequences_per_chunk / batch_size);
         }
-        printf("Resuming from batch %zu (chunk %zu, batch %d)\n", ((size_t)gpt->t * accum_steps), start_chunk, start_batch);
+        printf("Resuming from global batch %zu (chunk ~%zu)\n", global_batch, chunk_idx);
     }
 
-    // Training loop: process corpus in chunks with random sampling
-    for (size_t chunk_idx = start_chunk; chunk_idx < (total_sequences / sequences_per_chunk); chunk_idx++) {
-        // Sample next chunk of sequences from shuffled corpus
-        sample_sequences(corpus_path, &shuffled_indices[chunk_idx * sequences_per_chunk], seq_len, input_tokens, target_tokens, sequences_per_chunk);
-        
-        // Determine starting batch for this chunk
-        int batch_start = (chunk_idx == start_chunk) ? start_batch : 0;
+    // Training loop: process corpus in chunks with sequential reading
+    while (!feof(corpus_file)) {
+        // Read next text chunk and tokenize on-the-fly
+        printf("\n=== Chunk %zu ===\n", chunk_idx);
+        size_t num_sequences = read_tokenize_chunk(corpus_file, seq_len, input_tokens, target_tokens, sequences_per_chunk);
+        if (num_sequences < (size_t)batch_size) { printf("End of corpus (%zu sequences)\n", num_sequences); break; }
+
+        // Sanity check: verify target is input shifted by 1 (before shuffling)
+        int shift_ok = 1;
+        for (int j = 0; j < seq_len - 1; j++) {
+            if (target_tokens[j] != input_tokens[j + 1]) { shift_ok = 0; break; }
+        }
+        printf("  First 8 input IDs:  "); for (int j = 0; j < 8; j++) printf("%hu ", input_tokens[j]); printf("...\n");
+        printf("  First 8 target IDs: "); for (int j = 0; j < 8; j++) printf("%hu ", target_tokens[j]); printf("...\n");
+        printf("  Shift-by-1 check: %s\n", shift_ok ? "OK" : "FAILED!");
+        if (!shift_ok) { printf("  ABORTING: tokenization produced misaligned sequences\n"); raise(SIGINT); }
+
+        // Shuffle sequences within this chunk
+        shuffle_sequences(input_tokens, target_tokens, num_sequences, seq_len);
 
         // Train on all batches in this chunk
-        for (int batch = batch_start; batch < (int)(sequences_per_chunk / batch_size); batch++) {
+        for (int batch = 0; batch < (int)(num_sequences / batch_size); batch++) {
             struct timespec start; clock_gettime(CLOCK_MONOTONIC, &start);
-            
+
             // Copy batch to device
             CHECK_CUDA(cudaMemcpy(d_input_tokens, &input_tokens[batch * batch_size * seq_len], batch_size * seq_len * sizeof(unsigned short), cudaMemcpyHostToDevice));
             CHECK_CUDA(cudaMemcpy(d_target_tokens, &target_tokens[batch * batch_size * seq_len], batch_size * seq_len * sizeof(unsigned short), cudaMemcpyHostToDevice));
-            
+
             // Forward pass
             forward_pass_gpt(gpt, d_input_tokens);
-            
+
             // Calculate loss
             float loss = calculate_loss_gpt(gpt, d_target_tokens);
             if (loss >= 12.0) raise(SIGINT);
-            
+
             // Backward pass
             if (batch % accum_steps == 0) zero_gradients_gpt(gpt);
             backward_pass_gpt(gpt, d_input_tokens);
-            
+
             // Update weights with cosine learning rate schedule
             if ((batch + 1) % accum_steps == 0) {
-                float lr = learning_rate * fminf(1.0f, (float)(chunk_idx * (sequences_per_chunk / batch_size) + batch) / 1000.0f) * (0.1f + 0.45f * (1.0f + cosf(M_PI * ((float)(chunk_idx * (sequences_per_chunk / batch_size) + batch) / (float)(total_sequences / batch_size)))));
+                float lr = learning_rate * fminf(1.0f, (float)global_batch / 1000.0f) * (0.1f + 0.45f * (1.0f + cosf(M_PI * ((float)global_batch / (float)estimated_total_batches))));
                 update_weights_gpt(gpt, lr, batch_size * accum_steps);
 
                 CHECK_CUDA(cudaDeviceSynchronize()); struct timespec end; clock_gettime(CLOCK_MONOTONIC, &end);
-                printf("Chunk [%zu/%zu], Batch [%d/%d], Loss: %.6f, LR: %.7f, dt: %.2fms, tok/s: %.0f, bpb: %.4f, ETA: %.1fh\n",
-                    chunk_idx, total_sequences / sequences_per_chunk, batch, (int)(sequences_per_chunk / batch_size),
+                printf("Chunk [%zu], Batch [%d/%d], Loss: %.6f, LR: %.7f, dt: %.2fms, tok/s: %.0f, bpb: %.4f, ETA: %.1fh\n",
+                    chunk_idx, batch, (int)(num_sequences / batch_size),
                     loss, lr, ((end.tv_sec - start.tv_sec) * 1000.0 + (end.tv_nsec - start.tv_nsec) / 1e6),
                     (batch_size * seq_len) / ((end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9),
                     loss / log(2.0) / 2.0,
-                    ((double)total_sequences / batch_size - (chunk_idx * (sequences_per_chunk / batch_size) + batch) - 1) * ((end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9) / 3600.0);
+                    ((double)estimated_total_batches - global_batch - 1) * ((end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9) / 3600.0);
+
+                global_batch++;
             }
         }
-        
+
         // Generate sample text
         printf("\n--- Sample ---\n");
         generate_text(gpt, 0.001f, d_input_tokens, "<|bos|>The capital of France is", 64);
@@ -315,25 +323,27 @@ int main(int argc, char* argv[]) {
         generate_text(gpt, 0.001f, d_input_tokens, "<|bos|>My favorite color is", 64);
         generate_text(gpt, 0.001f, d_input_tokens, "<|bos|>If 5*x + 3 = 13, then x is", 64);
         printf("--- End ---\n\n");
-        
+
         // Save checkpoint
         save_gpt(gpt, "checkpoint_gpt.bin");
+        chunk_idx++;
     }
-    
+
+    fclose(corpus_file);
+
     // Save final model with timestamp
     char filename[64];
     time_t now = time(NULL);
     strftime(filename, sizeof(filename), "%Y%m%d_%H%M%S_gpt.bin", localtime(&now));
     save_gpt(gpt, filename);
-    
+
     // Cleanup
     free(input_tokens);
     free(target_tokens);
     CHECK_CUDA(cudaFree(d_input_tokens));
     CHECK_CUDA(cudaFree(d_target_tokens));
-    free(shuffled_indices);
     free_gpt(gpt);
     CHECK_CUBLASLT(cublasLtDestroy(cublaslt_handle));
-    
+
     return 0;
 }
