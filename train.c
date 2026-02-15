@@ -3,6 +3,8 @@
 #include <math.h>
 #include <time.h>
 #include <signal.h>
+#include <unistd.h>
+#include <string.h>
 #include <cuda_fp16.h>
 #include "gpt.h"
 
@@ -14,6 +16,38 @@ size_t get_file_size(const char* filename) {
     size_t size = ftell(f);
     fclose(f);
     return size;
+}
+
+// Tokenize text using SentencePiece and return token count
+size_t tokenize_text(const char* text, size_t text_len, unsigned short* tokens, size_t max_tokens) {
+    char temp_in[] = "/tmp/gpt_in_XXXXXX";
+    int fd_in = mkstemp(temp_in);
+    if (fd_in < 0) return 0;
+    
+    write(fd_in, text, text_len);
+    close(fd_in);
+    
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd),
+             "./sentencepiece/build/src/spm_encode "
+             "--model=./sentencepiece/spm_custom.model --output_format=id < %s",
+             temp_in);
+    
+    FILE* fp = popen(cmd, "r");
+    if (!fp) {
+        unlink(temp_in);
+        return 0;
+    }
+    
+    size_t count = 0;
+    while (count < max_tokens && fscanf(fp, "%hu", &tokens[count]) == 1) {
+        count++;
+    }
+    
+    pclose(fp);
+    unlink(temp_in);
+    
+    return count;
 }
 
 // Create shuffled sequence indices for entire corpus
@@ -38,24 +72,41 @@ size_t* create_shuffled_indices(size_t total_sequences) {
 
 // Sample sequences using shuffled indices
 void sample_sequences(const char* filename, size_t* indices, int seq_len, unsigned short* input_tokens, unsigned short* target_tokens, size_t num_sequences) {
-    FILE* f = fopen(filename, "rb");
+    FILE* f = fopen(filename, "r");
     if (!f) return;
     
-    unsigned char* buffer = (unsigned char*)malloc((seq_len + 1) * 2 * sizeof(unsigned char));
+    // Read text chunk (estimate ~4 bytes per token in source text)
+    size_t text_chunk_size = num_sequences * seq_len * 4;
+    char* text_buffer = (char*)malloc(text_chunk_size);
     
-    for (size_t i = 0; i < num_sequences; i++) {
-        fseek(f, indices[i] * seq_len * 2, SEEK_SET);
-        
-        if (fread(buffer, 1, (seq_len + 1) * 2, f) < (size_t)((seq_len + 1) * 2)) break;
-        
-        for (int j = 0; j < seq_len; j++) {
-            input_tokens[i * seq_len + j] = (unsigned short)((buffer[j * 2] << 8) | buffer[j * 2 + 1]);
-            target_tokens[i * seq_len + j] = (unsigned short)((buffer[(j + 1) * 2] << 8) | buffer[(j + 1) * 2 + 1]);
-        }
+    // Seek to approximate position based on first index
+    if (num_sequences > 0 && indices[0] > 0) {
+        fseek(f, indices[0] * seq_len * 4, SEEK_SET);
     }
     
-    free(buffer);
+    size_t bytes_read = fread(text_buffer, 1, text_chunk_size, f);
     fclose(f);
+    
+    if (bytes_read == 0) {
+        free(text_buffer);
+        return;
+    }
+    
+    // Tokenize the chunk
+    size_t max_tokens = num_sequences * (seq_len + 1);
+    unsigned short* all_tokens = (unsigned short*)malloc(max_tokens * sizeof(unsigned short));
+    size_t num_tokens = tokenize_text(text_buffer, bytes_read, all_tokens, max_tokens);
+    free(text_buffer);
+    
+    // Create input/target pairs from token stream
+    size_t seq_count = 0;
+    for (size_t i = 0; i + seq_len < num_tokens && seq_count < num_sequences; i += seq_len) {
+        memcpy(&input_tokens[seq_count * seq_len], &all_tokens[i], seq_len * sizeof(unsigned short));
+        memcpy(&target_tokens[seq_count * seq_len], &all_tokens[i + 1], seq_len * sizeof(unsigned short));
+        seq_count++;
+    }
+    
+    free(all_tokens);
 }
 
 GPT* gpt = NULL;
@@ -71,9 +122,9 @@ void handle_sigint(int signum) {
     exit(128 + signum);
 }
 
-void generate_text(GPT* gpt, float temperature, unsigned short* d_input_tokens, 
-                   const char* prompt, int gen_len) {
-    // Encode prompt via spm_encode
+// Generate text autoregressively from a prompt
+void generate_text(GPT* gpt, float temperature, unsigned short* d_input_tokens, const char* prompt, int gen_len) {
+    // Encode prompt using SentencePiece
     char cmd[2048];
     snprintf(cmd, sizeof(cmd), 
              "echo '%s' | ./sentencepiece/build/src/spm_encode "
@@ -81,7 +132,7 @@ void generate_text(GPT* gpt, float temperature, unsigned short* d_input_tokens,
              prompt);
     
     FILE* fp = popen(cmd, "r");
-    if (!fp) { fprintf(stderr, "Failed to encode\n"); return; }
+    if (!fp) return;
     
     unsigned short* h_tokens = (unsigned short*)calloc(gpt->seq_len, sizeof(unsigned short));
     int prompt_len = 0;
@@ -89,11 +140,15 @@ void generate_text(GPT* gpt, float temperature, unsigned short* d_input_tokens,
         prompt_len++;
     pclose(fp);
     
-    if (prompt_len == 0) { free(h_tokens); return; }
+    if (prompt_len == 0) {
+        free(h_tokens);
+        return;
+    }
     
     float* h_logits = (float*)malloc(gpt->vocab_size * sizeof(float));
     half* h_logits_half = (half*)malloc(gpt->vocab_size * sizeof(half));
     
+    // Generate tokens one at a time
     for (int pos = prompt_len - 1; pos < gen_len && pos < gpt->seq_len - 1; pos++) {
         CHECK_CUDA(cudaMemcpy(d_input_tokens, h_tokens, 
                    gpt->seq_len * sizeof(unsigned short), cudaMemcpyHostToDevice));
@@ -101,6 +156,7 @@ void generate_text(GPT* gpt, float temperature, unsigned short* d_input_tokens,
         CHECK_CUDA(cudaMemcpy(h_logits_half, &gpt->d_output[pos * gpt->vocab_size], 
                    gpt->vocab_size * sizeof(half), cudaMemcpyDeviceToHost));
         
+        // Apply temperature and compute softmax
         float max_logit = -1e30f;
         for (int v = 0; v < gpt->vocab_size; v++) {
             h_logits[v] = __half2float(h_logits_half[v]) / temperature;
@@ -111,19 +167,25 @@ void generate_text(GPT* gpt, float temperature, unsigned short* d_input_tokens,
             h_logits[v] = expf(h_logits[v] - max_logit);
             sum_exp += h_logits[v];
         }
-        for (int v = 0; v < gpt->vocab_size; v++) h_logits[v] /= sum_exp;
+        for (int v = 0; v < gpt->vocab_size; v++) {
+            h_logits[v] /= sum_exp;
+        }
         
+        // Sample from distribution
         float r = (float)rand() / (float)RAND_MAX;
         unsigned short next_token = 0;
         float cumsum = 0.0f;
         for (int v = 0; v < gpt->vocab_size; v++) {
             cumsum += h_logits[v];
-            if (r <= cumsum) { next_token = v; break; }
+            if (r <= cumsum) {
+                next_token = v;
+                break;
+            }
         }
         h_tokens[pos + 1] = next_token;
     }
     
-    // Decode via spm_decode
+    // Decode using SentencePiece
     char temp[] = "/tmp/gpt_XXXXXX";
     int fd = mkstemp(temp);
     FILE* tf = fdopen(fd, "w");
@@ -174,7 +236,7 @@ int main(int argc, char* argv[]) {
     printf("Parameters: ~%.1fM\n", (float)(gpt->vocab_size * gpt->d_model + gpt->transformer->num_layers * ((size_t)4 * gpt->d_model * gpt->d_model + gpt->d_model * gpt->transformer->mlp_layers[0]->hidden_dim + gpt->transformer->mlp_layers[0]->hidden_dim * gpt->d_model)) / 1e6f);
     
     // Create shuffled indices for random sampling without replacement
-    size_t total_sequences = (get_file_size(corpus_path) - 2) / (2 * seq_len);
+    size_t total_sequences = (get_file_size(corpus_path) / 4) / seq_len;
     size_t* shuffled_indices = create_shuffled_indices(total_sequences);
     
     // Allocate host buffers for sequences

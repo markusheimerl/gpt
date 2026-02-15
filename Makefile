@@ -3,7 +3,7 @@ CFLAGS = -O3 -march=native -ffast-math -Wall -Wextra -Wno-unknown-cuda-version
 LDFLAGS = -lopenblas -lm -flto
 
 ARCH ?= sm_86
-CUDAFLAGS = --cuda-path=/opt/cuda --cuda-path=/opt/cuda --cuda-gpu-arch=$(ARCH) -x cuda
+CUDAFLAGS = --cuda-path=/opt/cuda --cuda-gpu-arch=$(ARCH) -x cuda
 CUDALIBS = -L/opt/cuda/lib64 -lcudart -lcublasLt
 
 train.out: gpt.o transformer/transformer.o transformer/attention/attention.o transformer/mlp/mlp.o train.o
@@ -25,10 +25,10 @@ train.o: train.c gpt.h
 	$(CC) $(CFLAGS) $(CUDAFLAGS) -c train.c -o $@
 
 run: train.out
-	@time ./train.out corpus_tokenized.bin
+	@time ./train.out corpus.txt
 
 cont: train.out
-	@time ./train.out corpus_tokenized.bin $$(ls -t *_gpt.bin 2>/dev/null | head -n1)
+	@time ./train.out corpus.txt $$(ls -t *_gpt.bin 2>/dev/null | head -n1)
 
 clean:
 	rm -f *.out *.o *.csv
