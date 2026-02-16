@@ -5,7 +5,7 @@ import gc
 
 login()
 
-TOTAL_SIZE_GB = 50
+TOTAL_SIZE_GB = 60
 OUTPUT_FILE = "corpus.txt"
 SOURCES = {
     "finePDFs":      ("HuggingFaceFW/finepdfs",          {},                     0.50, 2341667),
