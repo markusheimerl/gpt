@@ -26,41 +26,116 @@ void tokenize_corpus(const char* text_path, const char* bin_path) {
     if (!bin_file) { fprintf(stderr, "Cannot create %s\n", bin_path); fclose(text_file); exit(1); }
 
     size_t corpus_size = get_file_size(text_path);
-    size_t chunk_size = 64 * 1024 * 1024;
+    size_t chunk_size = 512 * 1024 * 1024;
     char* text = (char*)malloc(chunk_size);
-    size_t max_tokens = 32 * 1024 * 1024;
+    size_t max_tokens = 256 * 1024 * 1024;
     unsigned short* tokens = (unsigned short*)malloc(max_tokens * sizeof(unsigned short));
     unsigned char* bytes = (unsigned char*)malloc(max_tokens * 2);
+    size_t out_buf_size = 512 * 1024 * 1024;
+    char* out_buf = (char*)malloc(out_buf_size);
     size_t total_tokens = 0;
+    struct timespec tok_start; clock_gettime(CLOCK_MONOTONIC, &tok_start);
+    #define NPAR 8
 
-    printf("Tokenizing %s (%.2f GB) -> %s\n", text_path, corpus_size / (1024.0 * 1024.0 * 1024.0), bin_path);
+    printf("Tokenizing %s (%.2f GB) -> %s (%d parallel)\n",
+           text_path, corpus_size / (1024.0 * 1024.0 * 1024.0), bin_path, NPAR);
 
     while (!feof(text_file)) {
         size_t n = fread(text, 1, chunk_size, text_file);
         if (n == 0) break;
+
+        // Back up to last <|bos|> so we don't split a document across chunks
         size_t orig_n = n;
-        while (n > 0 && text[n - 1] != '\n') n--;
+        for (size_t s = n; s >= 7; s--) {
+            if (memcmp(text + s - 7, "<|bos|>", 7) == 0) { n = s - 7; break; }
+        }
         if (n == 0) n = orig_n;
-        else fseek(text_file, -(long)(orig_n - n), SEEK_CUR);
+        if (n != orig_n) fseek(text_file, -(long)(orig_n - n), SEEK_CUR);
 
-        char tmp[] = "/tmp/gpt_tok_XXXXXX";
-        int fd = mkstemp(tmp);
-        if (fd < 0) continue;
-        FILE* tmp_fp = fdopen(fd, "w");
-        fwrite(text, 1, n, tmp_fp);
-        fclose(tmp_fp);
+        // Split into NPAR sub-chunks at <|bos|> boundaries
+        size_t offsets[NPAR + 1];
+        offsets[0] = 0;
+        offsets[NPAR] = n;
+        for (int p = 1; p < NPAR; p++) {
+            size_t target = n * p / NPAR;
+            while (target + 7 <= n && memcmp(text + target, "<|bos|>", 7) != 0) target++;
+            offsets[p] = (target + 7 <= n) ? target : offsets[p - 1];
+        }
 
-        char cmd[512];
-        snprintf(cmd, sizeof(cmd),
-                 "./sentencepiece/build/src/spm_encode "
-                 "--model=./sentencepiece/spm_custom.model --output_format=id < %s", tmp);
-        FILE* fp = popen(cmd, "r");
-        if (!fp) { unlink(tmp); continue; }
+        // Write sub-chunks to temp files
+        for (int p = 0; p < NPAR; p++) {
+            if (offsets[p + 1] <= offsets[p]) continue;
+            char name[64]; snprintf(name, sizeof(name), "/tmp/gpt_tok_in_%d", p);
+            FILE* f = fopen(name, "w");
+            fwrite(text + offsets[p], 1, offsets[p + 1] - offsets[p], f);
+            fclose(f);
+        }
+
+        // Launch all spm_encode processes in parallel
+        char cmd[4096] = "";
+        for (int p = 0; p < NPAR; p++) {
+            if (offsets[p + 1] <= offsets[p]) continue;
+            char part[512];
+            snprintf(part, sizeof(part),
+                     "./sentencepiece/build/src/spm_encode "
+                     "--model=./sentencepiece/spm_custom.model "
+                     "--output_format=id < /tmp/gpt_tok_in_%d > /tmp/gpt_tok_out_%d & ", p, p);
+            strcat(cmd, part);
+        }
+        strcat(cmd, "wait");
+        system(cmd);
+
+        // Read and parse all outputs in order
         size_t num_tokens = 0;
-        while (num_tokens < max_tokens && fscanf(fp, "%hu", &tokens[num_tokens]) == 1)
-            num_tokens++;
-        pclose(fp);
-        unlink(tmp);
+        for (int p = 0; p < NPAR; p++) {
+            if (offsets[p + 1] <= offsets[p]) continue;
+            char name[64]; snprintf(name, sizeof(name), "/tmp/gpt_tok_out_%d", p);
+            FILE* f = fopen(name, "rb");
+            if (!f) continue;
+            size_t out_len = fread(out_buf, 1, out_buf_size, f);
+            fclose(f);
+
+            char* pp = out_buf;
+            char* end = out_buf + out_len;
+            while (pp < end && num_tokens < max_tokens) {
+                while (pp < end && (*pp < '0' || *pp > '9')) pp++;
+                if (pp >= end) break;
+                unsigned int val = 0;
+                while (pp < end && *pp >= '0' && *pp <= '9') val = val * 10 + (*pp++ - '0');
+                tokens[num_tokens++] = (unsigned short)val;
+            }
+
+            snprintf(name, sizeof(name), "/tmp/gpt_tok_in_%d", p);  unlink(name);
+            snprintf(name, sizeof(name), "/tmp/gpt_tok_out_%d", p); unlink(name);
+        }
+
+        // First-chunk sanity check: verify encode/decode round-trip
+        if (total_tokens == 0 && num_tokens > 20) {
+            printf("\n  First 10 token IDs: ");
+            for (int j = 0; j < 10; j++) printf("%hu ", tokens[j]);
+            printf("...\n");
+            if (tokens[0] != 1) printf("  WARNING: first token is %hu, expected 1 (<|bos|>)\n", tokens[0]);
+
+            char tmp_sc[] = "/tmp/gpt_sc_XXXXXX";
+            int fd_sc = mkstemp(tmp_sc);
+            FILE* fp_sc = fdopen(fd_sc, "w");
+            for (int j = 0; j < 20; j++) fprintf(fp_sc, "%hu ", tokens[j]);
+            fclose(fp_sc);
+            char sc_cmd[512];
+            snprintf(sc_cmd, sizeof(sc_cmd),
+                     "./sentencepiece/build/src/spm_decode "
+                     "--model=./sentencepiece/spm_custom.model --input_format=id < %s", tmp_sc);
+            FILE* fp_dec = popen(sc_cmd, "r");
+            if (fp_dec) {
+                char dec_buf[512];
+                size_t dec_len = fread(dec_buf, 1, sizeof(dec_buf) - 1, fp_dec);
+                pclose(fp_dec);
+                while (dec_len > 0 && (dec_buf[dec_len-1] == '\n' || dec_buf[dec_len-1] == '\r')) dec_len--;
+                dec_buf[dec_len] = '\0';
+                printf("  Decoded: \"%s\"\n", dec_buf);
+            }
+            unlink(tmp_sc);
+        }
 
         for (size_t i = 0; i < num_tokens; i++) {
             bytes[i * 2] = tokens[i] >> 8;
@@ -68,13 +143,18 @@ void tokenize_corpus(const char* text_path, const char* bin_path) {
         }
         fwrite(bytes, 1, num_tokens * 2, bin_file);
         total_tokens += num_tokens;
-        printf("  %.1f%% (%zu tokens)\r", 100.0 * ftell(text_file) / corpus_size, total_tokens);
+
+        struct timespec tok_now; clock_gettime(CLOCK_MONOTONIC, &tok_now);
+        double elapsed = (tok_now.tv_sec - tok_start.tv_sec) + (tok_now.tv_nsec - tok_start.tv_nsec) / 1e9;
+        double progress = (double)ftell(text_file) / corpus_size;
+        double eta_min = progress > 0.001 ? (elapsed / progress - elapsed) / 60.0 : 0;
+        printf("  %.1f%% (%zu tokens, %.0f tok/s, ETA: %.1f min)\r", 100.0 * progress, total_tokens, total_tokens / elapsed, eta_min);
         fflush(stdout);
     }
 
     printf("\n  Done: %zu tokens (%.2f GB)\n", total_tokens, total_tokens * 2.0 / (1024.0 * 1024.0 * 1024.0));
     fclose(text_file); fclose(bin_file);
-    free(text); free(tokens); free(bytes);
+    free(text); free(tokens); free(bytes); free(out_buf);
 }
 
 // Create shuffled sequence indices for entire corpus
