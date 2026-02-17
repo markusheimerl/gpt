@@ -375,7 +375,7 @@ int main(int argc, char* argv[]) {
                     chunk_idx, total_sequences / sequences_per_chunk, batch, (int)(sequences_per_chunk / batch_size),
                     loss, lr, ((end.tv_sec - start.tv_sec) * 1000.0 + (end.tv_nsec - start.tv_nsec) / 1e6),
                     (batch_size * seq_len) / ((end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9),
-                    loss / log(2.0) / 2.0,
+                    loss / log(2.0) / 4.7144, // echo "scale=4; $(wc -c < corpus.txt) / ($(wc -c < corpus.txt.bin) / 2)" | bc
                     ((double)total_sequences / batch_size - (chunk_idx * (sequences_per_chunk / batch_size) + batch) - 1) * ((end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9) / 3600.0);
             }
         }
