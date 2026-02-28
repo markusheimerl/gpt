@@ -55,8 +55,11 @@ $$
 The implementation leverages BLAS for matrix operations, enabling efficient computation on modern hardware.
 
 ## How to run
-```
-sudo apt update
-sudo apt install clang time libopenblas-dev
-make run
+### Arch Linux
+```bash
+sudo pacman -S clang make time openblas
+sudo pacman -Udd https://archive.archlinux.org/packages/c/cuda/cuda-12.6.3-1-x86_64.pkg.tar.zst
+git clone https://github.com/markusheimerl/gpt && cd gpt/transformer/
+python3 get_corpus.py
+make run -j 6
 ```

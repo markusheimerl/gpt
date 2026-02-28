@@ -17,7 +17,7 @@ The implementation uses BLAS (Basic Linear Algebra Subprograms) for efficient ma
 ### Arch Linux
 ```bash
 sudo pacman -S clang make time openblas
-sudo pacman -Udd https://archive.archlinux.org/packages/c/cuda/cuda-12.8.1-1-x86_64.pkg.tar.zst
+sudo pacman -Udd https://archive.archlinux.org/packages/c/cuda/cuda-12.6.3-1-x86_64.pkg.tar.zst
 python3 -m pip install datasets
 git clone https://github.com/markusheimerl/gpt && cd gpt/
 python3 get_corpus.py
