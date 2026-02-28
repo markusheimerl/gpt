@@ -40,7 +40,7 @@ The implementation leverages BLAS for matrix operations, enabling efficient comp
 ### Arch Linux
 ```bash
 sudo pacman -Syu clang make time openblas
-sudo pacman -Udd https://archive.archlinux.org/packages/c/cuda/cuda-12.6.3-1-x86_64.pkg.tar.zst
+sudo pacman -Udd https://archive.archlinux.org/packages/c/cuda/cuda-12.8.1-1-x86_64.pkg.tar.zst
 git clone https://github.com/markusheimerl/gpt && cd gpt/transformer/mlp/
 make run -j 6
 ```
