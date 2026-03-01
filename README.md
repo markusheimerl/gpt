@@ -28,6 +28,7 @@ make -j$(nproc) && cd ../..
 python3 get_corpus.py
 
 make tokenize.out && ./tokenize.out
+make tokenize_corpus.out && ./tokenize_corpus.out
 
 make run -j 6
 ```
