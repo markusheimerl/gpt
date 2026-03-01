@@ -23,12 +23,16 @@ static void round_trip(const char *text) {
     f = popen(cmd, "r");
     if (!f) return;
     char ids[65536] = {0};
-    fgets(ids, sizeof(ids), f);
+    char line[4096];
+    while (fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\n")] = '\0';
+        if (*ids && *line) strcat(ids, " ");
+        strcat(ids, line);
+    }
     pclose(f);
-    ids[strcspn(ids, "\n")] = '\0';
 
     /* count tokens */
-    int n = 1;
+    int n = (*ids) ? 1 : 0;
     for (const char *p = ids; *p; p++) n += (*p == ' ');
 
     /* decode ids → text */
@@ -42,7 +46,7 @@ static void round_trip(const char *text) {
     f = popen(cmd, "r");
     if (!f) return;
     char decoded[65536] = {0};
-    fgets(decoded, sizeof(decoded), f);
+    while (fgets(line, sizeof(line), f)) strcat(decoded, line);
     pclose(f);
     decoded[strcspn(decoded, "\n")] = '\0';
 
@@ -62,7 +66,7 @@ int main(int argc, char *argv[]) {
         " --vocab_size=%d"
         " --model_type=bpe"
         " --character_coverage=1.0"
-        " --input_sentence_size=5000000"
+        " --input_sentence_size=100000"
         " --shuffle_input_sentence=true"
         " --unk_id=0"
         " --bos_id=-1"
