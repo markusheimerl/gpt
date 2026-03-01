@@ -27,6 +27,9 @@ train.o: train.c gpt.h
 tokenize.out: tokenize.c
 	$(CC) $(CFLAGS) tokenize.c -o $@
 
+tokenize_corpus.out: tokenize_corpus.c
+	$(CC) $(CFLAGS) tokenize_corpus.c -o $@
+
 run: train.out
 	@time ./train.out corpus.txt
 
