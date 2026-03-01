@@ -1,5 +1,5 @@
 CC = clang
-CFLAGS = -O3 -march=native -ffast-math -Wall -Wextra -Wno-unknown-cuda-version -Wno-unknown-cuda-version
+CFLAGS = -O3 -march=native -ffast-math -Wall -Wextra -Wno-unknown-cuda-version
 LDFLAGS = -lopenblas -lm -flto
 
 ARCH ?= sm_86
