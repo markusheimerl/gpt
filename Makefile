@@ -31,10 +31,10 @@ tokenize_corpus.out: tokenize_corpus.c
 	$(CC) $(CFLAGS) tokenize_corpus.c -o $@
 
 run: train.out
-	@time ./train.out corpus.txt
+	@time ./train.out corpus.txt.bin
 
 cont: train.out
-	@time ./train.out corpus.txt $$(ls -t *_gpt.bin 2>/dev/null | head -n1)
+	@time ./train.out corpus.txt.bin $$(ls -t *_gpt.bin 2>/dev/null | head -n1)
 
 clean:
 	rm -f *.out *.o *.csv
