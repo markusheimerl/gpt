@@ -20,6 +20,12 @@ sudo pacman -Syu clang make time openblas
 sudo pacman -Udd https://archive.archlinux.org/packages/c/cuda/cuda-12.8.1-1-x86_64.pkg.tar.zst
 python3 -m pip install datasets
 git clone --recurse-submodules https://github.com/markusheimerl/gpt && cd gpt/
+
+mkdir -p sentencepiece/build && cd sentencepiece/build
+cmake .. -DSPM_ENABLE_SHARED=OFF -DSPM_BUILD_TEST=OFF -DCMAKE_BUILD_TYPE=Release
+make -j$(nproc) && cd ../..
+make tokenize.out && ./tokenize.out
+
 python3 get_corpus.py
 make run -j 6
 ```

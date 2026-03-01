@@ -24,6 +24,9 @@ transformer/mlp/mlp.o:
 train.o: train.c gpt.h
 	$(CC) $(CFLAGS) $(CUDAFLAGS) -c train.c -o $@
 
+tokenize.out: tokenize.c
+	$(CC) $(CFLAGS) tokenize.c -o $@
+
 run: train.out
 	@time ./train.out corpus.txt
 
