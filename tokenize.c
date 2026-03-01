@@ -6,27 +6,12 @@
 #define SPM_TRAIN    "sentencepiece/build/src/spm_train"
 #define SPM_ENCODE   "sentencepiece/build/src/spm_encode"
 #define SPM_DECODE   "sentencepiece/build/src/spm_decode"
-#define SAMPLE_FILE  "spm_sample.txt"
 #define MODEL_PREFIX "spm_model"
-#define VOCAB_SIZE   32000
-#define DEFAULT_LINES 10000
-
-static int write_sample(const char *src, int max_lines) {
-    FILE *in  = fopen(src, "r");
-    FILE *out = fopen(SAMPLE_FILE, "w");
-    if (!in || !out) { if (in) fclose(in); if (out) fclose(out); return -1; }
-    char *line = NULL; size_t cap = 0; ssize_t len; int n = 0;
-    while (n < max_lines && (len = getline(&line, &cap, in)) > 0)
-        { fwrite(line, 1, len, out); n++; }
-    free(line); fclose(in); fclose(out);
-    printf("Wrote %d lines to %s\n", n, SAMPLE_FILE);
-    return n;
-}
+#define VOCAB_SIZE   65536  /* 2^16 */
 
 static void round_trip(const char *text) {
     char cmd[512];
 
-    /* write input to temp file to avoid any shell quoting issues */
     FILE *f = fopen("/tmp/spm_in.txt", "w");
     if (!f) return;
     fprintf(f, "%s\n", text);
@@ -66,24 +51,35 @@ static void round_trip(const char *text) {
 
 int main(int argc, char *argv[]) {
     const char *corpus = argc > 1 ? argv[1] : "corpus.txt";
-    int lines = argc > 2 ? atoi(argv[2]) : DEFAULT_LINES;
 
-    if (write_sample(corpus, lines) <= 0) { fprintf(stderr, "Failed to read %s\n", corpus); return 1; }
+    printf("Training BPE tokenizer (vocab=%d) on %s...\n", VOCAB_SIZE, corpus);
 
-    printf("Training BPE tokenizer (vocab=%d)...\n", VOCAB_SIZE);
-    char cmd[512];
+    char cmd[1024];
     snprintf(cmd, sizeof(cmd),
-        "%s --input=%s --model_prefix=%s --vocab_size=%d"
-        " --model_type=bpe --character_coverage=1.0"
-        " --unk_id=0 --bos_id=1 --eos_id=2 --pad_id=3",
-        SPM_TRAIN, SAMPLE_FILE, MODEL_PREFIX, VOCAB_SIZE);
+        "%s"
+        " --input=%s"
+        " --model_prefix=%s"
+        " --vocab_size=%d"
+        " --model_type=bpe"
+        " --character_coverage=1.0"
+        " --input_sentence_size=5000000"
+        " --shuffle_input_sentence=true"
+        " --unk_id=0"
+        " --bos_id=-1"
+        " --eos_id=-1"
+        " --pad_id=-1"
+        " --user_defined_symbols='<|bos|>,<|user|>,<|assistant|>'",
+        SPM_TRAIN, corpus, MODEL_PREFIX, VOCAB_SIZE);
+
     if (system(cmd) != 0) { fprintf(stderr, "Training failed\n"); return 1; }
     printf("Saved %s.model\n\n", MODEL_PREFIX);
 
     const char *tests[] = {
-        "<|bos|>The capital of France is Paris.",
-        "Hello world, this is a tokenizer test.",
-        "The quick brown fox jumps over the lazy dog.",
+        "<|bos|><|user|>\nWhat is the capital of France?",
+        "<|bos|><|assistant|>\nThe capital of France is Paris.",
+        "<|bos|>The quick brown fox jumps over the lazy dog.",
+        "<|bos|>Hello world, this is a tokenizer test.",
+        "<|bos|>The planets of the solar system are: Mercury, Venus, Earth, Mars.",
         NULL
     };
     for (int i = 0; tests[i]; i++) round_trip(tests[i]);
