@@ -2,148 +2,213 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <sys/stat.h>
 
-#define SPM_ENCODE   "sentencepiece/build/src/spm_encode"
-#define MODEL_PREFIX "spm_model"
+#define SPM_ENCODE       "sentencepiece/build/src/spm_encode"
+#define MODEL_PREFIX     "spm_model"
 #define WRITE_BUF_TOKENS (1 << 20)
 
-static size_t count_lines(const char* path) {
-    FILE* f = fopen(path, "r");
-    if (!f) { perror("fopen"); return 0; }
-
-    size_t n = 0;
-    char buf[1 << 20];
-    size_t bytes;
-    while ((bytes = fread(buf, 1, sizeof(buf), f)) > 0)
-        for (size_t i = 0; i < bytes; i++)
-            if (buf[i] == '\n') n++;
-
-    fclose(f);
-    return n;
-}
-
 static void fmt_eta(double secs, char* out, size_t sz) {
-    int h = (int)(secs / 3600);
-    int m = (int)((secs - h * 3600) / 60);
-    int s = (int)(secs) % 60;
+    int h = (int)(secs / 3600), m = (int)((secs - h*3600) / 60), s = (int)secs % 60;
     if (h > 0) snprintf(out, sz, "%dh%02dm%02ds", h, m, s);
     else        snprintf(out, sz, "%dm%02ds", m, s);
 }
 
-int main(int argc, char* argv[]) {
-    const char* input_file = argc > 1 ? argv[1] : "corpus.txt";
+/* Seek to approx_offset, advance past next '\n', return that position */
+static off_t next_line_start(const char* path, off_t approx, off_t file_size) {
+    if (approx <= 0)        return 0;
+    if (approx >= file_size) return file_size;
+    FILE* f = fopen(path, "rb");
+    if (!f) return approx;
+    fseeko(f, approx, SEEK_SET);
+    while (!feof(f) && fgetc(f) != '\n');
+    off_t pos = ftello(f);
+    fclose(f);
+    return pos >= file_size ? file_size : pos;
+}
 
-    char output_file[512];
-    snprintf(output_file, sizeof(output_file), "%s.bin", input_file);
-
-    printf("Counting lines in %s ...\n", input_file); fflush(stdout);
-    size_t total_lines_expected = count_lines(input_file);
-    printf("  %zu lines\n", total_lines_expected);
-
-    printf("Tokenizing: %s -> %s\n", input_file, output_file); fflush(stdout);
-
+/* Child: pipe chunk [start,end) through spm_encode → binary file */
+static void run_worker(const char* inp, off_t start, off_t end, const char* out_bin) {
     char cmd[1024];
     snprintf(cmd, sizeof(cmd),
-             "%s --model=%s.model --output_format=id < \"%s\"",
-             SPM_ENCODE, MODEL_PREFIX, input_file);
+        "dd if='%s' bs=65536 skip=%zu count=%zu iflag=skip_bytes,count_bytes 2>/dev/null"
+        " | %s --model=%s.model --output_format=id",
+        inp, (size_t)start, (size_t)(end - start), SPM_ENCODE, MODEL_PREFIX);
 
     FILE* spm = popen(cmd, "r");
-    if (!spm) { perror("popen"); return 1; }
+    if (!spm) { perror("popen"); _exit(1); }
 
-    FILE* out = fopen(output_file, "wb");
-    if (!out) { perror("fopen"); pclose(spm); return 1; }
+    FILE* fout = fopen(out_bin, "wb");
+    if (!fout) { perror("fopen worker out"); pclose(spm); _exit(1); }
 
-    unsigned char* wbuf = (unsigned char*)malloc(WRITE_BUF_TOKENS * 2);
-    if (!wbuf) { fputs("OOM\n", stderr); fclose(out); pclose(spm); return 1; }
+    unsigned char* wbuf = malloc(WRITE_BUF_TOKENS * 2);
+    size_t wpos = 0;
+    char*  line = NULL;
+    size_t cap  = 0;
 
-    char*   line     = NULL;
-    size_t  line_cap = 0;
-    ssize_t line_len;
-    size_t  wbuf_pos     = 0;
-    size_t  total_tokens = 0;
-    size_t  total_lines  = 0;
-
-    struct timespec t0, tnow;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-
-    while ((line_len = getline(&line, &line_cap, spm)) > 0) {
-        char* ptr = line;
-        char* end;
-
-        while (*ptr) {
-            while (*ptr == ' ' || *ptr == '\t' || *ptr == '\n' || *ptr == '\r')
-                ptr++;
-            if (!*ptr) break;
-
-            long id = strtol(ptr, &end, 10);
-            if (end == ptr) break;
-            ptr = end;
-
+    while (getline(&line, &cap, spm) > 0) {
+        char *p = line, *ep;
+        while (*p) {
+            while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+            if (!*p) break;
+            long id = strtol(p, &ep, 10);
+            if (ep == p) break;
+            p = ep;
             unsigned short tok = (unsigned short)(id & 0xFFFF);
-            wbuf[wbuf_pos * 2]     = (tok >> 8) & 0xFF;
-            wbuf[wbuf_pos * 2 + 1] =  tok       & 0xFF;
-            wbuf_pos++;
-            total_tokens++;
+            wbuf[wpos * 2]     = (tok >> 8) & 0xFF;
+            wbuf[wpos * 2 + 1] =  tok       & 0xFF;
+            if (++wpos == WRITE_BUF_TOKENS) { fwrite(wbuf, 2, wpos, fout); wpos = 0; }
+        }
+    }
+    if (wpos) fwrite(wbuf, 2, wpos, fout);
 
-            if (wbuf_pos == WRITE_BUF_TOKENS) {
-                if (fwrite(wbuf, 2, WRITE_BUF_TOKENS, out) != WRITE_BUF_TOKENS) {
-                    perror("fwrite"); goto cleanup;
+    free(wbuf); free(line);
+    pclose(spm);
+    fclose(fout);
+    _exit(0);
+}
+
+int main(int argc, char* argv[]) {
+    const char* inp = argc > 1 ? argv[1] : "corpus.txt";
+    int nw = argc > 2 ? atoi(argv[2]) : (int)sysconf(_SC_NPROCESSORS_ONLN);
+    if (nw < 1) nw = 1;
+    if (nw > 64) nw = 64;
+
+    char out[512];
+    snprintf(out, sizeof(out), "%s.bin", inp);
+
+    struct stat st;
+    if (stat(inp, &st) != 0) { perror("stat"); return 1; }
+    off_t fsz = st.st_size;
+
+    printf("Input  : %s (%.2f GB)\n", inp,  (double)fsz / 1073741824.0);
+    printf("Output : %s\n", out);
+    printf("Workers: %d\n\n", nw);
+    fflush(stdout);
+
+    /* Line-snapped chunk boundaries */
+    off_t* bounds = malloc((nw + 1) * sizeof(off_t));
+    bounds[0] = 0;
+    for (int i = 1; i < nw; i++)
+        bounds[i] = next_line_start(inp, (off_t)((double)fsz * i / nw), fsz);
+    bounds[nw] = fsz;
+
+    /* Temp files sit beside the output file to avoid /tmp space issues */
+    char** tmps = malloc(nw * sizeof(char*));
+    for (int i = 0; i < nw; i++) {
+        tmps[i] = malloc(strlen(out) + 32);
+        sprintf(tmps[i], "%s.chunk%d", out, i);
+    }
+
+    /* Fork workers */
+    pid_t* pids = malloc(nw * sizeof(pid_t));
+    struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    for (int i = 0; i < nw; i++) {
+        printf("Worker %d: [%.3f GB, %.3f GB)\n", i,
+               (double)bounds[i]   / 1073741824.0,
+               (double)bounds[i+1] / 1073741824.0);
+        pids[i] = fork();
+        if (pids[i] < 0) { perror("fork"); return 1; }
+        if (pids[i] == 0)
+            run_worker(inp, bounds[i], bounds[i+1], tmps[i]);
+    }
+    printf("\nAll %d workers running...\n\n", nw); fflush(stdout);
+
+    /* Wait with periodic progress from temp-file sizes */
+    int  ndone = 0;
+    int* done  = calloc(nw, sizeof(int));
+
+    while (ndone < nw) {
+        int status;
+        pid_t finished = waitpid(-1, &status, WNOHANG);
+
+        if (finished > 0) {
+            for (int i = 0; i < nw; i++) {
+                if (pids[i] == finished && !done[i]) {
+                    done[i] = 1; ndone++;
+                    struct timespec tn; clock_gettime(CLOCK_MONOTONIC, &tn);
+                    double el = (tn.tv_sec - t0.tv_sec) + (tn.tv_nsec - t0.tv_nsec) * 1e-9;
+                    printf("\nWorker %d finished  [%d/%d done]  %.1fs elapsed\n",
+                           i, ndone, nw, el);
+                    fflush(stdout);
+                    break;
                 }
-                wbuf_pos = 0;
             }
-        }
+        } else if (finished == 0) {
+            struct timespec tn; clock_gettime(CLOCK_MONOTONIC, &tn);
+            double el = (tn.tv_sec - t0.tv_sec) + (tn.tv_nsec - t0.tv_nsec) * 1e-9;
 
-        total_lines++;
+            /* Sum up binary bytes written across all temp files */
+            size_t written = 0;
+            for (int i = 0; i < nw; i++) {
+                struct stat ts;
+                if (stat(tmps[i], &ts) == 0) written += (size_t)ts.st_size;
+            }
 
-        if (total_lines % 10000 == 0) {
-            clock_gettime(CLOCK_MONOTONIC, &tnow);
-            double elapsed = (tnow.tv_sec  - t0.tv_sec) +
-                             (tnow.tv_nsec - t0.tv_nsec) * 1e-9;
-            double frac    = total_lines_expected > 0
-                             ? (double)total_lines / (double)total_lines_expected
-                             : 0.0;
-            double eta_sec = frac > 0.0 ? elapsed / frac - elapsed : 0.0;
+            size_t toks = written / 2;
+            double tps  = el > 1.0 ? (double)toks / el : 0.0;
 
+            /* Rough progress: BPE on English/mixed text ≈ 1 token per 4 bytes of input */
+            double est_frac = (double)(toks * 4) / (double)fsz;
+            if (est_frac > 1.0) est_frac = 1.0;
+            double eta = (est_frac > 0.001 && el > 2.0) ? el / est_frac - el : 0.0;
             char eta_str[32];
-            fmt_eta(eta_sec, eta_str, sizeof(eta_str));
+            if (est_frac <= 0.001 || el <= 2.0)
+                snprintf(eta_str, sizeof(eta_str), "calculating...");
+            else
+                fmt_eta(eta, eta_str, sizeof(eta_str));
 
-            printf("\r  %5.1f%% | lines: %7zu/%zu | tokens: %10zu | "
-                   "%.0f tok/s | %.3f GB | ETA: %-12s",
-                   frac * 100.0,
-                   total_lines, total_lines_expected,
-                   total_tokens,
-                   total_tokens / elapsed,
-                   (double)(total_tokens * 2) / (1024.0 * 1024.0 * 1024.0),
-                   eta_str);
+            printf("\r  [%d/%d done] | %5.1f%% | %.2f GB | %.0f ktok/s | ETA: %-16s",
+                   ndone, nw, est_frac * 100.0,
+                   (double)written / 1073741824.0,
+                   tps / 1000.0, eta_str);
             fflush(stdout);
+            sleep(1);
+        } else break;
+    }
+    free(done);
+
+    struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
+    double elapsed = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9;
+    printf("\n\nAll workers done in %.1fs. Merging %d chunks → %s ...\n",
+           elapsed, nw, out);
+    fflush(stdout);
+
+    /* Concatenate chunk binaries in order */
+    FILE* fout = fopen(out, "wb");
+    if (!fout) { perror("fopen output"); return 1; }
+
+    size_t total_toks = 0;
+    unsigned char* mbuf = malloc(WRITE_BUF_TOKENS * 2);
+
+    for (int i = 0; i < nw; i++) {
+        FILE* fin = fopen(tmps[i], "rb");
+        if (!fin) { fprintf(stderr, "Cannot open chunk %s\n", tmps[i]); continue; }
+        size_t n;
+        while ((n = fread(mbuf, 2, WRITE_BUF_TOKENS, fin)) > 0) {
+            fwrite(mbuf, 2, n, fout);
+            total_toks += n;
         }
+        fclose(fin);
+        unlink(tmps[i]);
+        printf("  Merged chunk %d\n", i); fflush(stdout);
     }
+    free(mbuf);
+    fclose(fout);
 
-    if (wbuf_pos > 0) {
-        if (fwrite(wbuf, 2, wbuf_pos, out) != wbuf_pos)
-            perror("fwrite");
-    }
-
-cleanup:
-    free(line);
-    free(wbuf);
-    fclose(out);
-
-    int rc = pclose(spm);
-    if (rc != 0)
-        fprintf(stderr, "\nspm_encode exited with status %d\n", rc);
-
-    printf("\n\nDone.\n");
-    printf("  Lines  : %zu\n",  total_lines);
-    printf("  Tokens : %zu\n",  total_tokens);
-    printf("  Output : %s  (%.3f GB)\n", output_file,
-           (double)(total_tokens * 2) / (1024.0 * 1024.0 * 1024.0));
+    printf("\nDone.\n");
+    printf("  Tokens  : %zu\n", total_toks);
+    printf("  Output  : %s  (%.3f GB)\n", out, (double)(total_toks * 2) / 1073741824.0);
+    printf("  Time    : %.1fs\n", elapsed);
 
     const int seq_len = 512;
-    size_t sequences = total_tokens > (size_t)seq_len
-                       ? (total_tokens - seq_len) / seq_len
-                       : 0;
-    printf("  Usable sequences (seq_len=%d): %zu\n", seq_len, sequences);
+    size_t seqs = total_toks > (size_t)seq_len ? (total_toks - seq_len) / seq_len : 0;
+    printf("  Usable sequences (seq_len=%d): %zu\n", seq_len, seqs);
 
-    return rc != 0 ? 1 : 0;
+    for (int i = 0; i < nw; i++) free(tmps[i]);
+    free(tmps); free(bounds); free(pids);
+    return 0;
 }
