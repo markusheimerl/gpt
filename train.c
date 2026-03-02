@@ -103,6 +103,18 @@ void generate_text(GPT* gpt, float temperature, unsigned short* d_input_tokens, 
     float* h_logits = (float*)malloc(gpt->vocab_size * sizeof(float));
     half* h_logits_half = (half*)malloc(gpt->vocab_size * sizeof(half));
     char prev_decoded[65536] = {0};
+
+    // Anchor: decode last prompt token alone to establish the boundary baseline
+    FILE* ids = fopen("/tmp/gpt_stream.txt", "w");
+    fprintf(ids, "%d\n", h_tokens[prompt_len - 1]);
+    fclose(ids);
+    snprintf(cmd, sizeof(cmd), "sentencepiece/build/src/spm_decode --model=spm_model.model --input_format=id < /tmp/gpt_stream.txt");
+    FILE* dec = popen(cmd, "r");
+    if (dec) {
+        if (fgets(prev_decoded, sizeof(prev_decoded), dec))
+            prev_decoded[strcspn(prev_decoded, "\n")] = '\0';
+        pclose(dec);
+    }
     
     // Generate tokens one at a time
     for (int pos = prompt_len - 1; pos < gen_len; pos++) {
@@ -149,9 +161,11 @@ void generate_text(GPT* gpt, float temperature, unsigned short* d_input_tokens, 
         // Add sampled token to sequence
         h_tokens[pos + 1] = next_token;
         
-        // Decode generated tokens so far, print only the new suffix
+        // Decode last prompt token + all generated so far, print only the new suffix
         FILE* ids = fopen("/tmp/gpt_stream.txt", "w");
-        for (int i = prompt_len; i <= pos + 1; i++) fprintf(ids, "%d%c", h_tokens[i], i < pos + 1 ? ' ' : '\n');
+        fprintf(ids, "%d", h_tokens[prompt_len - 1]);
+        for (int i = prompt_len; i <= pos + 1; i++) fprintf(ids, " %d", h_tokens[i]);
+        fprintf(ids, "\n");
         fclose(ids);
         snprintf(cmd, sizeof(cmd), "sentencepiece/build/src/spm_decode --model=spm_model.model --input_format=id < /tmp/gpt_stream.txt");
         FILE* dec = popen(cmd, "r");
