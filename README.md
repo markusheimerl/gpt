@@ -17,6 +17,7 @@ The implementation uses BLAS (Basic Linear Algebra Subprograms) for efficient ma
 ### Arch Linux
 ```bash
 sudo pacman -Syu clang make time openblas nvidia nvidia-utils python python-pip cmake git
+sudo reboot
 sudo pacman -Udd https://archive.archlinux.org/packages/c/cuda/cuda-12.8.1-1-x86_64.pkg.tar.zst
 python3 -m pip install datasets
 git clone --recurse-submodules https://github.com/markusheimerl/gpt && cd gpt/

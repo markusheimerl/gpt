@@ -58,6 +58,7 @@ The implementation leverages BLAS for matrix operations, enabling efficient comp
 ### Arch Linux
 ```bash
 sudo pacman -Syu clang make time openblas nvidia nvidia-utils python python-pip cmake git
+sudo reboot
 sudo pacman -Udd https://archive.archlinux.org/packages/c/cuda/cuda-12.8.1-1-x86_64.pkg.tar.zst
 git clone https://github.com/markusheimerl/gpt && cd gpt/transformer/
 make run -j 6
