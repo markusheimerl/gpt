@@ -36,6 +36,18 @@ run: train.out
 cont: train.out
 	@time ./train.out corpus.txt.bin $$(ls -t *_gpt.bin 2>/dev/null | head -n1)
 
+infer.out: infer.c
+	$(CC) $(CFLAGS) infer.c -lopenblas -lm -o infer.out
+
+trim.out: trim.c
+	$(CC) $(CFLAGS) trim.c -o trim.out
+
+trim: trim.out
+	@./trim.out $$(ls -t *_gpt.bin 2>/dev/null | grep -v "_trim" | head -n1)
+
+infer: infer.out
+	@./infer.out $$(ls -t *_gpt_trim.bin 2>/dev/null | head -n1)
+
 clean:
 	rm -f *.out *.o *.csv
 	$(MAKE) -C transformer/ clean

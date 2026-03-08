@@ -31,5 +31,7 @@ python3 get_corpus.py
 make tokenize.out && ./tokenize.out
 make tokenize_corpus.out && ./tokenize_corpus.out
 
-make run -j 6
+make run -j 6 # Takes about 180 hours on a single RTX 3090
+make trim # Remove the optimizer state from the model's savefile
+make infer # Chat with the trimmed final model using the CPU only
 ```
