@@ -27,11 +27,9 @@ cmake .. -DSPM_ENABLE_SHARED=OFF -DSPM_BUILD_TEST=OFF -DCMAKE_BUILD_TYPE=Release
 make -j$(nproc) && cd ../..
 
 python3 get_corpus.py
+make train_tokenizer # Takes about 45 minutes on a i5-12400F
 
-make tokenize.out && ./tokenize.out
-make tokenize_corpus.out && ./tokenize_corpus.out
-
-make run -j 6 # Takes about 180 hours on a single RTX 3090
-make trim # Remove the optimizer state from the model's savefile
-make infer # Chat with the trimmed final model using the CPU only
+make train # Takes about 180 hours on a single RTX 3090
+make trim # Remove the optimizer state from the model's savefile to reduce total file size to 1/3 of the original
+make infer # Chat with the trimmed model using the CPU only
 ```

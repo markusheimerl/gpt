@@ -6,9 +6,95 @@
 #include <sys/wait.h>
 #include <sys/stat.h>
 
-#define SPM_ENCODE       "sentencepiece/build/src/spm_encode"
-#define MODEL_PREFIX     "spm_model"
+#define SPM_TRAIN    "sentencepiece/build/src/spm_train"
+#define SPM_ENCODE   "sentencepiece/build/src/spm_encode"
+#define SPM_DECODE   "sentencepiece/build/src/spm_decode"
+#define MODEL_PREFIX "spm_model"
+#define VOCAB_SIZE   65536
 #define WRITE_BUF_TOKENS (1 << 20)
+
+// ============================================================================
+// Tokenizer training and round-trip test
+// ============================================================================
+
+static void round_trip(const char *text) {
+    char cmd[512];
+
+    FILE *f = fopen("/tmp/spm_in.txt", "w");
+    if (!f) return;
+    fprintf(f, "%s\n", text);
+    fclose(f);
+
+    snprintf(cmd, sizeof(cmd), "%s --model=%s.model --output_format=id < /tmp/spm_in.txt",
+             SPM_ENCODE, MODEL_PREFIX);
+    f = popen(cmd, "r");
+    if (!f) return;
+    char ids[65536] = {0};
+    char line[4096];
+    while (fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\n")] = '\0';
+        if (*ids && *line) strcat(ids, " ");
+        strcat(ids, line);
+    }
+    pclose(f);
+
+    int n = (*ids) ? 1 : 0;
+    for (const char *p = ids; *p; p++) n += (*p == ' ');
+
+    FILE *tmp = fopen("/tmp/spm_ids.txt", "w");
+    if (!tmp) return;
+    fprintf(tmp, "%s\n", ids);
+    fclose(tmp);
+
+    snprintf(cmd, sizeof(cmd), "%s --model=%s.model --input_format=id < /tmp/spm_ids.txt",
+             SPM_DECODE, MODEL_PREFIX);
+    f = popen(cmd, "r");
+    if (!f) return;
+    char decoded[65536] = {0};
+    while (fgets(line, sizeof(line), f)) strcat(decoded, line);
+    pclose(f);
+    decoded[strcspn(decoded, "\n")] = '\0';
+
+    printf("in:  %s\nids: [%s] len=%d\nout: %s\n\n", text, ids, n, decoded);
+}
+
+static void train_tokenizer(const char *corpus) {
+    printf("Training BPE tokenizer (vocab=%d) on %s...\n", VOCAB_SIZE, corpus);
+
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd),
+        "%s"
+        " --input=%s"
+        " --model_prefix=%s"
+        " --vocab_size=%d"
+        " --model_type=bpe"
+        " --character_coverage=1.0"
+        " --input_sentence_size=100000"
+        " --shuffle_input_sentence=true"
+        " --unk_id=0"
+        " --bos_id=-1"
+        " --eos_id=-1"
+        " --pad_id=-1"
+        " --user_defined_symbols='<|bos|>,<|user|>,<|assistant|>'",
+        SPM_TRAIN, corpus, MODEL_PREFIX, VOCAB_SIZE);
+
+    if (system(cmd) != 0) { fprintf(stderr, "Training failed\n"); exit(1); }
+    printf("Saved %s.model\n\n", MODEL_PREFIX);
+
+    const char *tests[] = {
+        "<|bos|><|user|>\nWhat is the capital of France?",
+        "<|bos|><|assistant|>\nThe capital of France is Paris.",
+        "<|bos|>The quick brown fox jumps over the lazy dog.",
+        "<|bos|>Hello world, this is a tokenizer test.",
+        "<|bos|>The planets of the solar system are: Mercury, Venus, Earth, Mars.",
+        NULL
+    };
+    for (int i = 0; tests[i]; i++) round_trip(tests[i]);
+}
+
+// ============================================================================
+// Corpus tokenization
+// ============================================================================
 
 static void fmt_eta(double secs, char* out, size_t sz) {
     int h = (int)(secs / 3600), m = (int)((secs - h*3600) / 60), s = (int)secs % 60;
@@ -16,9 +102,8 @@ static void fmt_eta(double secs, char* out, size_t sz) {
     else        snprintf(out, sz, "%dm%02ds", m, s);
 }
 
-/* Seek to approx_offset, advance past next '\n', return that position */
 static off_t next_line_start(const char* path, off_t approx, off_t file_size) {
-    if (approx <= 0)        return 0;
+    if (approx <= 0)         return 0;
     if (approx >= file_size) return file_size;
     FILE* f = fopen(path, "rb");
     if (!f) return approx;
@@ -29,7 +114,6 @@ static off_t next_line_start(const char* path, off_t approx, off_t file_size) {
     return pos >= file_size ? file_size : pos;
 }
 
-/* Child: pipe chunk [start,end) through spm_encode → binary file */
 static void run_worker(const char* inp, off_t start, off_t end, const char* out_bin) {
     char cmd[1024];
     snprintf(cmd, sizeof(cmd),
@@ -70,9 +154,7 @@ static void run_worker(const char* inp, off_t start, off_t end, const char* out_
     _exit(0);
 }
 
-int main(int argc, char* argv[]) {
-    const char* inp = argc > 1 ? argv[1] : "corpus.txt";
-    int nw = argc > 2 ? atoi(argv[2]) : (int)sysconf(_SC_NPROCESSORS_ONLN);
+static void tokenize_corpus(const char* inp, int nw) {
     if (nw < 1) nw = 1;
     if (nw > 64) nw = 64;
 
@@ -80,7 +162,7 @@ int main(int argc, char* argv[]) {
     snprintf(out, sizeof(out), "%s.bin", inp);
 
     struct stat st;
-    if (stat(inp, &st) != 0) { perror("stat"); return 1; }
+    if (stat(inp, &st) != 0) { perror("stat"); exit(1); }
     off_t fsz = st.st_size;
 
     printf("Input  : %s (%.2f GB)\n", inp,  (double)fsz / 1073741824.0);
@@ -88,21 +170,18 @@ int main(int argc, char* argv[]) {
     printf("Workers: %d\n\n", nw);
     fflush(stdout);
 
-    /* Line-snapped chunk boundaries */
     off_t* bounds = malloc((nw + 1) * sizeof(off_t));
     bounds[0] = 0;
     for (int i = 1; i < nw; i++)
         bounds[i] = next_line_start(inp, (off_t)((double)fsz * i / nw), fsz);
     bounds[nw] = fsz;
 
-    /* Temp files sit beside the output file to avoid /tmp space issues */
     char** tmps = malloc(nw * sizeof(char*));
     for (int i = 0; i < nw; i++) {
         tmps[i] = malloc(strlen(out) + 32);
         sprintf(tmps[i], "%s.chunk%d", out, i);
     }
 
-    /* Fork workers */
     pid_t* pids = malloc(nw * sizeof(pid_t));
     struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
 
@@ -111,13 +190,12 @@ int main(int argc, char* argv[]) {
                (double)bounds[i]   / 1073741824.0,
                (double)bounds[i+1] / 1073741824.0);
         pids[i] = fork();
-        if (pids[i] < 0) { perror("fork"); return 1; }
+        if (pids[i] < 0) { perror("fork"); exit(1); }
         if (pids[i] == 0)
             run_worker(inp, bounds[i], bounds[i+1], tmps[i]);
     }
     printf("\nAll %d workers running...\n\n", nw); fflush(stdout);
 
-    /* Wait with periodic progress from temp-file sizes */
     int  ndone = 0;
     int* done  = calloc(nw, sizeof(int));
 
@@ -141,7 +219,6 @@ int main(int argc, char* argv[]) {
             struct timespec tn; clock_gettime(CLOCK_MONOTONIC, &tn);
             double el = (tn.tv_sec - t0.tv_sec) + (tn.tv_nsec - t0.tv_nsec) * 1e-9;
 
-            /* Sum up binary bytes written across all temp files */
             size_t written = 0;
             for (int i = 0; i < nw; i++) {
                 struct stat ts;
@@ -150,8 +227,6 @@ int main(int argc, char* argv[]) {
 
             size_t toks = written / 2;
             double tps  = el > 1.0 ? (double)toks / el : 0.0;
-
-            /* Rough progress: BPE on English/mixed text ≈ 1 token per 4 bytes of input */
             double est_frac = (double)(toks * 4) / (double)fsz;
             if (est_frac > 1.0) est_frac = 1.0;
             double eta = (est_frac > 0.001 && el > 2.0) ? el / est_frac - el : 0.0;
@@ -177,9 +252,8 @@ int main(int argc, char* argv[]) {
            elapsed, nw, out);
     fflush(stdout);
 
-    /* Concatenate chunk binaries in order */
     FILE* fout = fopen(out, "wb");
-    if (!fout) { perror("fopen output"); return 1; }
+    if (!fout) { perror("fopen output"); exit(1); }
 
     size_t total_toks = 0;
     unsigned char* mbuf = malloc(WRITE_BUF_TOKENS * 2);
@@ -210,5 +284,18 @@ int main(int argc, char* argv[]) {
 
     for (int i = 0; i < nw; i++) free(tmps[i]);
     free(tmps); free(bounds); free(pids);
+}
+
+// ============================================================================
+// Main
+// ============================================================================
+
+int main(int argc, char* argv[]) {
+    const char* corpus = argc > 1 ? argv[1] : "corpus.txt";
+    int nw = argc > 2 ? atoi(argv[2]) : (int)sysconf(_SC_NPROCESSORS_ONLN);
+
+    train_tokenizer(corpus);
+    tokenize_corpus(corpus, nw);
+
     return 0;
 }
