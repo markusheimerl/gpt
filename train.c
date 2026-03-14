@@ -3,6 +3,7 @@
 #include <math.h>
 #include <time.h>
 #include <signal.h>
+#include <string.h>
 #include <cuda_fp16.h>
 #include "gpt.h"
 
@@ -76,19 +77,47 @@ void generate_text(GPT* gpt, float temperature, unsigned short* d_input_tokens, 
     // Start with zero-initialized sequence
     unsigned short* h_tokens = (unsigned short*)calloc(gpt->seq_len, sizeof(unsigned short));
     
-    // Set beginning of sequence (prompt)
-    for (int i = 0; i < (int)(strlen(bos) + 1) / 2; i++) {
-        h_tokens[i] = (unsigned short)((unsigned char)bos[i * 2] << 8) | ((unsigned long)(i * 2 + 1) < strlen(bos) ? (unsigned char)bos[i * 2 + 1] : ' ');
+    // Encode prompt with spm_encode
+    int prompt_len = 0;
+    char cmd[512];
+    FILE* f = fopen("/tmp/gpt_prompt.txt", "w"); fprintf(f, "%s\n", bos); fclose(f);
+    snprintf(cmd, sizeof(cmd), "sentencepiece/build/src/spm_encode --model=spm_model.model --output_format=id < /tmp/gpt_prompt.txt");
+    FILE* enc = popen(cmd, "r");
+    if (enc) {
+        char buf[65536] = {0};
+        if (fgets(buf, sizeof(buf), enc)) {
+            char *p = buf, *ep;
+            while (*p && prompt_len < gpt->seq_len - gen_len - 1) {
+                while (*p == ' ' || *p == '\t') p++;
+                if (!*p || *p == '\n') break;
+                long id = strtol(p, &ep, 10); if (ep == p) break;
+                h_tokens[prompt_len++] = (unsigned short)(id & 0xFFFF); p = ep;
+            }
+        }
+        pclose(enc);
     }
     
-    printf("\"%s%s", bos, (strlen(bos) % 2) ? " " : "");
+    printf("\"%s", bos);
     fflush(stdout);
     
     float* h_logits = (float*)malloc(gpt->vocab_size * sizeof(float));
     half* h_logits_half = (half*)malloc(gpt->vocab_size * sizeof(half));
+    char prev_decoded[65536] = {0};
+
+    // Anchor: decode last prompt token alone to establish the boundary baseline
+    FILE* ids = fopen("/tmp/gpt_stream.txt", "w");
+    fprintf(ids, "%d\n", h_tokens[prompt_len - 1]);
+    fclose(ids);
+    snprintf(cmd, sizeof(cmd), "sentencepiece/build/src/spm_decode --model=spm_model.model --input_format=id < /tmp/gpt_stream.txt");
+    FILE* dec = popen(cmd, "r");
+    if (dec) {
+        if (fgets(prev_decoded, sizeof(prev_decoded), dec))
+            prev_decoded[strcspn(prev_decoded, "\n")] = '\0';
+        pclose(dec);
+    }
     
     // Generate tokens one at a time
-    for (int pos = (strlen(bos) + 1) / 2 - 1; pos < gen_len; pos++) {
+    for (int pos = prompt_len - 1; pos < gen_len; pos++) {
         // Copy current sequence to device
         CHECK_CUDA(cudaMemcpy(d_input_tokens, h_tokens, gpt->seq_len * sizeof(unsigned short), cudaMemcpyHostToDevice));
         
@@ -96,7 +125,7 @@ void generate_text(GPT* gpt, float temperature, unsigned short* d_input_tokens, 
         forward_pass_gpt(gpt, d_input_tokens);
         
         // Copy logits for current position back to host
-        CHECK_CUDA(cudaMemcpy(h_logits_half, &gpt->d_output[pos * gpt->vocab_size], gpt->vocab_size * sizeof(half), cudaMemcpyDeviceToHost));
+        CHECK_CUDA(cudaMemcpy(h_logits_half, &gpt->d_output[(size_t)pos * gpt->vocab_size], gpt->vocab_size * sizeof(half), cudaMemcpyDeviceToHost));
         
         // Convert to float
         for (int v = 0; v < gpt->vocab_size; v++) {
@@ -126,16 +155,30 @@ void generate_text(GPT* gpt, float temperature, unsigned short* d_input_tokens, 
         float cumsum = 0.0f;
         for (int v = 0; v < gpt->vocab_size; v++) {
             cumsum += h_logits[v];
-            if (r <= cumsum) {
-                next_token = v;
-                break;
-            }
+            if (r <= cumsum) { next_token = v; break; }
         }
         
         // Add sampled token to sequence
         h_tokens[pos + 1] = next_token;
-        printf("%c%c", (char)(next_token >> 8), (char)(next_token & 0xFF));
-        fflush(stdout);
+        
+        // Decode last prompt token + all generated so far, print only the new suffix
+        FILE* ids = fopen("/tmp/gpt_stream.txt", "w");
+        fprintf(ids, "%d", h_tokens[prompt_len - 1]);
+        for (int i = prompt_len; i <= pos + 1; i++) fprintf(ids, " %d", h_tokens[i]);
+        fprintf(ids, "\n");
+        fclose(ids);
+        snprintf(cmd, sizeof(cmd), "sentencepiece/build/src/spm_decode --model=spm_model.model --input_format=id < /tmp/gpt_stream.txt");
+        FILE* dec = popen(cmd, "r");
+        if (dec) {
+            char curr[65536] = {0};
+            if (fgets(curr, sizeof(curr), dec)) {
+                curr[strcspn(curr, "\n")] = '\0';
+                printf("%s", curr + strlen(prev_decoded));
+                fflush(stdout);
+                strcpy(prev_decoded, curr);
+            }
+            pclose(dec);
+        }
     }
     
     printf("\"\n");
@@ -238,7 +281,7 @@ int main(int argc, char* argv[]) {
                     chunk_idx, total_sequences / sequences_per_chunk, batch, (int)(sequences_per_chunk / batch_size),
                     loss, lr, ((end.tv_sec - start.tv_sec) * 1000.0 + (end.tv_nsec - start.tv_nsec) / 1e6),
                     (batch_size * seq_len) / ((end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9),
-                    loss / log(2.0) / 2.0,
+                    loss / log(2.0) / 4.7834,
                     ((double)total_sequences / batch_size - (chunk_idx * (sequences_per_chunk / batch_size) + batch) - 1) * ((end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9) / 3600.0);
             }
         }

@@ -1,62 +1,128 @@
-from datasets import load_dataset
+import requests
+import pyarrow.parquet as pq
+import os
+import random
+from huggingface_hub import login, list_repo_files, get_token
 
-TOTAL_SIZE_GB = 22
-OUTPUT_FILE = "corpus.txt"
+TOTAL_SIZE_GB = 50
+TARGET_BYTES  = TOTAL_SIZE_GB * 1024**3
+OUTPUT_FILE   = "corpus.txt"
+
 SOURCES = {
-    "finePDFs":      ("HuggingFaceFW/finepdfs",          {},                     0.50, 789054),
-    "DCLM-baseline": ("mlfoundations/dclm-baseline-1.0", {},                     0.20, 970567),
-    "FineWeb-Edu":   ("HuggingFaceFW/fineweb-edu",       {"name": "sample-10BT"},0.20, 231489),
-    "LMSYS-Chat":    ("lmsys/lmsys-chat-1m",             {},                     0.10, 452387),
+    "finePhrases": ("HuggingFaceFW/finephrase", None, 0.70, 123456),
+    "LMSYS-Chat":  ("lmsys/lmsys-chat-1m",      None, 0.30, 452387),
 }
 
-def format_example(example):
-    if "conversation" in example:
-        body = "\n".join(f"<|{t['role']}|>\n{t['content']}" for t in example["conversation"])
+def get_parquet_files(repo_id, path_filter=None):
+    files = list_repo_files(repo_id, repo_type="dataset")
+    files = [f for f in files if f.endswith(".parquet")]
+    if path_filter:
+        files = [f for f in files if path_filter in f]
+    return sorted(files)
+
+def download_shard(repo_id, fname, tmp_path):
+    token = get_token()
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    url = f"https://huggingface.co/datasets/{repo_id}/resolve/main/{fname}"
+    print(f"  Downloading [{repo_id}]: {fname}")
+    with requests.get(url, stream=True, headers=headers) as r:
+        r.raise_for_status()
+        with open(tmp_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=8 * 1024 * 1024):
+                f.write(chunk)
+
+def load_shard(name, fname, seed):
+    repo_id = SOURCES[name][0]
+    tmp = f"tmp_{name}.parquet"
+    download_shard(repo_id, fname, tmp)
+    cols = ["conversation", "language"] if name == "LMSYS-Chat" else ["text"]
+    table = pq.read_table(tmp, columns=cols)
+    os.remove(tmp)
+    rows = table.to_pylist()
+    del table
+    if name == "LMSYS-Chat":
+        rows = [r for r in rows if r.get("language") == "English"]
+    random.Random(seed).shuffle(rows)
+    return rows
+
+def refill_buffer(name, buffers, shard_lists, indices):
+    idx = indices[name]
+    if idx >= len(shard_lists[name]):
+        return False
+    seed = SOURCES[name][3]
+    rows = load_shard(name, shard_lists[name][idx], seed + idx)
+    buffers[name].extend(rows)
+    indices[name] += 1
+    return True
+
+def format_row(name, row):
+    if name == "LMSYS-Chat":
+        body = "\n".join(f"<|{t['role']}|>\n{t['content']}" for t in row["conversation"])
     else:
-        body = example["text"]
+        body = row["text"]
     return f"<|bos|>{body}\n"
 
 def main():
-    targets = {n: r * TOTAL_SIZE_GB * 1024**3 for n, (_, _, r, _) in SOURCES.items()}
-    sizes = dict.fromkeys(SOURCES, 0)
-    counts = dict.fromkeys(SOURCES, 0)
+    targets   = {n: r * TARGET_BYTES for n, (_, _, r, _) in SOURCES.items()}
+    sizes     = dict.fromkeys(SOURCES, 0)
+    indices   = dict.fromkeys(SOURCES, 0)
+    doc_count = 0
 
-    print("Downloading and combining data...")
-    for n in SOURCES:
-        print(f"  {n}: {targets[n]/1024**3:.1f} GB ({SOURCES[n][2]:.0%})")
+    shard_lists = {}
+    for name, (repo_id, path_filter, _, seed) in SOURCES.items():
+        print(f"Listing shards for {name}...")
+        shards = get_parquet_files(repo_id, path_filter)
+        random.Random(seed).shuffle(shards)
+        shard_lists[name] = shards
+        print(f"  {len(shards)} shards found")
 
-    iterators = {
-        n: iter(load_dataset(path, split="train", streaming=True, **kw)
-                .shuffle(seed=seed, buffer_size=10000))
-        for n, (path, kw, _, seed) in SOURCES.items()
-    }
+    buffers = {n: [] for n in SOURCES}
+    for name in SOURCES:
+        refill_buffer(name, buffers, shard_lists, indices)
 
-    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-        while active := {n for n in SOURCES if sizes[n] < targets[n]}:
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as out:
+        while sum(sizes.values()) < TARGET_BYTES:
+
+            # sources that still have data
+            active = {n for n in SOURCES
+                      if buffers[n] or indices[n] < len(shard_lists[n])}
+            if not active:
+                print("All sources exhausted before reaching target!")
+                break
+
+            # pick source most behind its ratio, among those still available
             source = min(active, key=lambda n: sizes[n] / targets[n])
-            try:
-                example = next(iterators[source])
-            except StopIteration:
-                print(f"Warning: {source} exhausted")
-                targets[source] = 0
+
+            # refill if running low
+            if len(buffers[source]) < 100:
+                refill_buffer(source, buffers, shard_lists, indices)
+
+            if not buffers[source]:
+                # this source truly ran out, adjust its target so others fill in
+                print(f"  {source} exhausted at {sizes[source]/1024**3:.2f} GB")
+                targets[source] = sizes[source]  # freeze its target
+                # redistribute its remaining quota proportionally to others
+                leftover = TARGET_BYTES - sum(targets.values())
+                remaining_sources = [n for n in SOURCES if n != source]
+                total_ratio = sum(SOURCES[n][2] for n in remaining_sources)
+                for n in remaining_sources:
+                    targets[n] += leftover * (SOURCES[n][2] / total_ratio)
                 continue
 
-            if source == "LMSYS-Chat" and example.get("language") != "English":
-                continue
-
-            text = format_example(example)
-            f.write(text)
+            row  = buffers[source].pop()
+            text = format_row(source, row)
+            out.write(text)
             sizes[source] += len(text.encode("utf-8"))
-            counts[source] += 1
+            doc_count += 1
 
-            if sum(counts.values()) % 1000 == 0:
+            if doc_count % 10000 == 0:
                 total = sum(sizes.values())
                 parts = " | ".join(f"{n}: {sizes[n]/1024**3:.2f}GB" for n in SOURCES)
-                print(f"{sum(counts.values()):,} docs | {parts} | total: {total/1024**3:.2f}GB")
+                print(f"{doc_count:,} docs | {parts} | total: {total/1024**3:.2f}GB")
 
-    print(f"\n✓ Done!")
+    print(f"\nDone!")
     for n in SOURCES:
-        print(f"  {n}: {counts[n]:,} docs ({sizes[n]/1024**3:.2f} GB)")
+        print(f"  {n}: {sizes[n]/1024**3:.2f} GB")
     print(f"  Total: {sum(sizes.values())/1024**3:.2f} GB")
 
 if __name__ == "__main__":

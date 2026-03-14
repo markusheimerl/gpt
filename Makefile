@@ -6,6 +6,12 @@ ARCH ?= sm_86
 CUDAFLAGS = --cuda-gpu-arch=$(ARCH) -x cuda
 CUDALIBS = -L/opt/cuda/lib64 -lcudart -lcublasLt
 
+tokenize.out: tokenize.c
+	$(CC) $(CFLAGS) tokenize.c -o $@
+
+tokenize: tokenize.out
+	@./tokenize.out
+
 train.out: gpt.o transformer/transformer.o transformer/attention/attention.o transformer/mlp/mlp.o train.o
 	$(CC) gpt.o transformer/transformer.o transformer/attention/attention.o transformer/mlp/mlp.o train.o $(CUDALIBS) $(LDFLAGS) -o $@
 
@@ -24,11 +30,23 @@ transformer/mlp/mlp.o:
 train.o: train.c gpt.h
 	$(CC) $(CFLAGS) $(CUDAFLAGS) -c train.c -o $@
 
-run: train.out
-	@time ./train.out corpus.txt
+train: train.out
+	@time ./train.out corpus.txt.bin
 
 cont: train.out
-	@time ./train.out corpus.txt $$(ls -t *_gpt.bin 2>/dev/null | head -n1)
+	@time ./train.out corpus.txt.bin $$(ls -t *_gpt.bin 2>/dev/null | head -n1)
+
+trim.out: trim.c
+	$(CC) $(CFLAGS) trim.c -o trim.out
+
+trim: trim.out
+	@./trim.out $$(ls -t *_gpt.bin 2>/dev/null | grep -v "_trim" | head -n1)
+
+infer.out: infer.c
+	$(CC) $(CFLAGS) infer.c -lopenblas -lm -o infer.out
+
+infer: infer.out
+	@./infer.out $$(ls -t *_gpt_trim.bin 2>/dev/null | head -n1)
 
 clean:
 	rm -f *.out *.o *.csv
