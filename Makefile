@@ -6,11 +6,11 @@ ARCH ?= sm_86
 CUDAFLAGS = --cuda-gpu-arch=$(ARCH) -x cuda
 CUDALIBS = -L/opt/cuda/lib64 -lcudart -lcublasLt
 
-train_tokenizer.out: train_tokenizer.c
-	$(CC) $(CFLAGS) train_tokenizer.c -o $@
+tokenize.out: tokenize.c
+	$(CC) $(CFLAGS) tokenize.c -o $@
 
-train_tokenizer: train_tokenizer.out
-	@./train_tokenizer.out
+tokenize: tokenize.out
+	@./tokenize.out
 
 train.out: gpt.o transformer/transformer.o transformer/attention/attention.o transformer/mlp/mlp.o train.o
 	$(CC) gpt.o transformer/transformer.o transformer/attention/attention.o transformer/mlp/mlp.o train.o $(CUDALIBS) $(LDFLAGS) -o $@
