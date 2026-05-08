@@ -48,6 +48,12 @@ infer.out: infer.c
 infer: infer.out
 	@./infer.out $$(ls -t *_gpt_trim.bin 2>/dev/null | head -n1)
 
+server.out: server.c
+	$(CC) $(CFLAGS) server.c -lopenblas -lm -lpthread -o server.out
+
+server: server.out
+	@./server.out $$(ls -t *_gpt_trim.bin 2>/dev/null | head -n1)
+
 clean:
 	rm -f *.out *.o *.csv
 	$(MAKE) -C transformer/ clean
