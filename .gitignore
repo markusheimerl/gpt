@@ -56,3 +56,4 @@ dkms.conf
 *.vocab
 screenlog*
 *.chunk*
+*.csv

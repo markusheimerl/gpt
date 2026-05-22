@@ -5,12 +5,12 @@ A generative pretrained transformer implementation
 
 
 ## How to run
-### Arch Linux
+### Ubuntu
 ```bash
-sudo pacman -Syu clang make time openblas nvidia nvidia-utils python python-pip cmake git
+sudo apt update
+sudo apt install -y clang make time libopenblas-dev nvidia-cuda-toolkit python3 python3-pip cmake build-essential git
 sudo reboot
-sudo pacman -Udd https://archive.archlinux.org/packages/c/cuda/cuda-12.8.1-1-x86_64.pkg.tar.zst
-python3 -m pip install datasets
+python3 -m pip install --break-system-packages datasets
 git clone --recurse-submodules https://github.com/markusheimerl/gpt && cd gpt/
 
 mkdir -p sentencepiece/build && cd sentencepiece/build

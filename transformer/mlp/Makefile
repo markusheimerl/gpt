@@ -3,8 +3,8 @@ CFLAGS = -O3 -march=native -ffast-math -Wall -Wextra -Wno-unknown-cuda-version
 LDFLAGS = -lopenblas -lm -flto
 
 ARCH ?= sm_86
-CUDAFLAGS = --cuda-gpu-arch=$(ARCH) -x cuda
-CUDALIBS = -L/opt/cuda/lib64 -lcudart -lcublasLt
+CUDAFLAGS = --cuda-path=/usr/lib/cuda --cuda-gpu-arch=$(ARCH) -x cuda
+CUDALIBS = -L/usr/lib/x86_64-linux-gnu -lcudart -lcublasLt
 
 test.out: mlp.o test.o
 	$(CC) mlp.o test.o $(CUDALIBS) $(LDFLAGS) -o $@
