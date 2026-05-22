@@ -57,3 +57,4 @@ dkms.conf
 screenlog*
 *.chunk*
 *.csv
+*.parquet

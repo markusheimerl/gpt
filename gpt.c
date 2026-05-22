@@ -1,5 +1,18 @@
 #include "gpt.h"
 
+// cuBLASLt matrix multiplication macro
+#define LT_MATMUL(obj, opA, opB, alpha, A, layA, B, layB, beta, C, layC) do { \
+    cublasOperation_t _opA = opA, _opB = opB; \
+    CHECK_CUBLASLT(cublasLtMatmulDescSetAttribute((obj)->matmul_desc, \
+                   CUBLASLT_MATMUL_DESC_TRANSA, &_opA, sizeof(_opA))); \
+    CHECK_CUBLASLT(cublasLtMatmulDescSetAttribute((obj)->matmul_desc, \
+                   CUBLASLT_MATMUL_DESC_TRANSB, &_opB, sizeof(_opB))); \
+    CHECK_CUBLASLT(cublasLtMatmul((obj)->cublaslt_handle, (obj)->matmul_desc, \
+                                  alpha, A, layA, B, layB, \
+                                  beta, C, layC, \
+                                  C, layC, NULL, NULL, 0, 0)); \
+} while(0)
+
 // Initialize the GPT
 GPT* init_gpt(int seq_len, int d_model, int hidden_dim, int num_layers, int batch_size, cublasLtHandle_t cublaslt_handle) {
     GPT* gpt = (GPT*)malloc(sizeof(GPT));

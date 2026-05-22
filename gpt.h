@@ -11,45 +11,6 @@
 #include <cuda_fp16.h>
 #include "transformer/transformer.h"
 
-// CUDA Error checking macro
-#ifndef CHECK_CUDA
-#define CHECK_CUDA(call) do { \
-    cudaError_t err = call; \
-    if (err != cudaSuccess) { \
-        fprintf(stderr, "CUDA error in %s:%d: %s\n", __FILE__, __LINE__, \
-                cudaGetErrorString(err)); \
-        exit(EXIT_FAILURE); \
-    } \
-} while(0)
-#endif
-
-// cuBLASLt Error checking macro
-#ifndef CHECK_CUBLASLT
-#define CHECK_CUBLASLT(call) do { \
-    cublasStatus_t status = call; \
-    if (status != CUBLAS_STATUS_SUCCESS) { \
-        fprintf(stderr, "cuBLASLt error in %s:%d: %d\n", __FILE__, __LINE__, \
-                (int)status); \
-        exit(EXIT_FAILURE); \
-    } \
-} while(0)
-#endif
-
-// cuBLASLt matrix multiplication macro
-#ifndef LT_MATMUL
-#define LT_MATMUL(gpt, opA, opB, alpha, A, layA, B, layB, beta, C, layC) do { \
-    cublasOperation_t _opA = opA, _opB = opB; \
-    CHECK_CUBLASLT(cublasLtMatmulDescSetAttribute(gpt->matmul_desc, \
-                   CUBLASLT_MATMUL_DESC_TRANSA, &_opA, sizeof(_opA))); \
-    CHECK_CUBLASLT(cublasLtMatmulDescSetAttribute(gpt->matmul_desc, \
-                   CUBLASLT_MATMUL_DESC_TRANSB, &_opB, sizeof(_opB))); \
-    CHECK_CUBLASLT(cublasLtMatmul(gpt->cublaslt_handle, gpt->matmul_desc, \
-                                  alpha, A, layA, B, layB, \
-                                  beta, C, layC, \
-                                  C, layC, NULL, NULL, 0, 0)); \
-} while(0)
-#endif
-
 typedef struct {
     // Token embedding layer
     half* d_token_embedding;       // [vocab_size x d_model]

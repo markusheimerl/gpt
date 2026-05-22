@@ -63,6 +63,8 @@ def format_row(name, row):
     return f"<|bos|>{body}\n"
 
 def main():
+    if get_token() is None:
+        login()
     targets   = {n: r * TARGET_BYTES for n, (_, _, r, _) in SOURCES.items()}
     sizes     = dict.fromkeys(SOURCES, 0)
     indices   = dict.fromkeys(SOURCES, 0)

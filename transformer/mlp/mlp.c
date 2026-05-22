@@ -1,5 +1,18 @@
 #include "mlp.h"
 
+// cuBLASLt matrix multiplication macro
+#define LT_MATMUL(obj, opA, opB, alpha, A, layA, B, layB, beta, C, layC) do { \
+    cublasOperation_t _opA = opA, _opB = opB; \
+    CHECK_CUBLASLT(cublasLtMatmulDescSetAttribute((obj)->matmul_desc, \
+                   CUBLASLT_MATMUL_DESC_TRANSA, &_opA, sizeof(_opA))); \
+    CHECK_CUBLASLT(cublasLtMatmulDescSetAttribute((obj)->matmul_desc, \
+                   CUBLASLT_MATMUL_DESC_TRANSB, &_opB, sizeof(_opB))); \
+    CHECK_CUBLASLT(cublasLtMatmul((obj)->cublaslt_handle, (obj)->matmul_desc, \
+                                  alpha, A, layA, B, layB, \
+                                  beta, C, layC, \
+                                  C, layC, NULL, NULL, 0, 0)); \
+} while(0)
+
 // Initialize the MLP
 MLP* init_mlp(int input_dim, int hidden_dim, int output_dim, int batch_size, cublasLtHandle_t cublaslt_handle) {
     MLP* mlp = (MLP*)malloc(sizeof(MLP));
