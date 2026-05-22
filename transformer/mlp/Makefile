@@ -4,7 +4,7 @@ LDFLAGS = -lopenblas -lm -flto
 
 ARCH ?= sm_86
 CUDAFLAGS = --cuda-gpu-arch=$(ARCH) -x cuda
-CUDALIBS = -L/usr/local/cuda/lib64 -lcudart -lcublasLt
+CUDALIBS = -lcudart -lcublasLt
 
 test.out: mlp.o test.o
 	$(CC) mlp.o test.o $(CUDALIBS) $(LDFLAGS) -o $@

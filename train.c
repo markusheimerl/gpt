@@ -37,20 +37,20 @@ size_t* create_shuffled_indices(size_t total_sequences) {
 }
 
 // Sample sequences using shuffled indices
-void sample_sequences(const char* filename, size_t* indices, int seq_len, unsigned short* input_tokens, unsigned short* target_tokens, size_t num_sequences) {
+void sample_sequences(const char* filename, size_t* indices, int seq_len, unsigned char* input_tokens, unsigned char* target_tokens, size_t num_sequences) {
     FILE* f = fopen(filename, "rb");
     if (!f) return;
     
-    unsigned char* buffer = (unsigned char*)malloc((seq_len + 1) * 2 * sizeof(unsigned char));
+    unsigned char* buffer = (unsigned char*)malloc((seq_len + 1) * sizeof(unsigned char));
     
     for (size_t i = 0; i < num_sequences; i++) {
-        fseek(f, indices[i] * seq_len * 2, SEEK_SET);
+        fseek(f, indices[i] * seq_len, SEEK_SET);
         
-        if (fread(buffer, 1, (seq_len + 1) * 2, f) < (size_t)((seq_len + 1) * 2)) break;
+        if (fread(buffer, 1, seq_len + 1, f) < (size_t)(seq_len + 1)) break;
         
         for (int j = 0; j < seq_len; j++) {
-            input_tokens[i * seq_len + j] = (unsigned short)((buffer[j * 2] << 8) | buffer[j * 2 + 1]);
-            target_tokens[i * seq_len + j] = (unsigned short)((buffer[(j + 1) * 2] << 8) | buffer[(j + 1) * 2 + 1]);
+            input_tokens[i * seq_len + j] = buffer[j];
+            target_tokens[i * seq_len + j] = buffer[j + 1];
         }
     }
     
@@ -72,25 +72,26 @@ void handle_sigint(int signum) {
 }
 
 // Generate text autoregressively from a prompt
-void generate_text(GPT* gpt, float temperature, unsigned short* d_input_tokens, const char* bos, int gen_len) {
+void generate_text(GPT* gpt, float temperature, unsigned char* d_input_tokens, const char* bos, int gen_len) {
     // Start with zero-initialized sequence
-    unsigned short* h_tokens = (unsigned short*)calloc(gpt->seq_len, sizeof(unsigned short));
+    unsigned char* h_tokens = (unsigned char*)calloc(gpt->seq_len, sizeof(unsigned char));
     
     // Set beginning of sequence (prompt)
-    for (int i = 0; i < (int)(strlen(bos) + 1) / 2; i++) {
-        h_tokens[i] = (unsigned short)((unsigned char)bos[i * 2] << 8) | ((unsigned long)(i * 2 + 1) < strlen(bos) ? (unsigned char)bos[i * 2 + 1] : ' ');
+    int bos_len = (int)strlen(bos);
+    for (int i = 0; i < bos_len; i++) {
+        h_tokens[i] = (unsigned char)bos[i];
     }
     
-    printf("\"%s%s", bos, (strlen(bos) % 2) ? " " : "");
+    printf("\"%s", bos);
     fflush(stdout);
     
     float* h_logits = (float*)malloc(gpt->vocab_size * sizeof(float));
     half* h_logits_half = (half*)malloc(gpt->vocab_size * sizeof(half));
     
     // Generate tokens one at a time
-    for (int pos = (strlen(bos) + 1) / 2 - 1; pos < gen_len; pos++) {
+    for (int pos = bos_len - 1; pos < gen_len; pos++) {
         // Copy current sequence to device
-        CHECK_CUDA(cudaMemcpy(d_input_tokens, h_tokens, gpt->seq_len * sizeof(unsigned short), cudaMemcpyHostToDevice));
+        CHECK_CUDA(cudaMemcpy(d_input_tokens, h_tokens, gpt->seq_len * sizeof(unsigned char), cudaMemcpyHostToDevice));
         
         // Forward pass to get logits
         forward_pass_gpt(gpt, d_input_tokens);
@@ -122,19 +123,19 @@ void generate_text(GPT* gpt, float temperature, unsigned short* d_input_tokens, 
         
         // Sample from the distribution
         float r = (float)rand() / (float)RAND_MAX;
-        unsigned short next_token = 0;
+        unsigned char next_token = 0;
         float cumsum = 0.0f;
         for (int v = 0; v < gpt->vocab_size; v++) {
             cumsum += h_logits[v];
             if (r <= cumsum) {
-                next_token = v;
+                next_token = (unsigned char)v;
                 break;
             }
         }
         
         // Add sampled token to sequence
         h_tokens[pos + 1] = next_token;
-        printf("%c%c", (char)(next_token >> 8), (char)(next_token & 0xFF));
+        printf("%c", (char)next_token);
         fflush(stdout);
     }
     
@@ -156,9 +157,9 @@ int main(int argc, char* argv[]) {
     CHECK_CUBLASLT(cublasLtCreate(&cublaslt_handle));
 
     // Model hyperparameters
-    const int seq_len = 512;
-    const int num_layers = 21;
-    const int batch_size = 22;
+    const int seq_len = 1024;
+    const int num_layers = 16;
+    const int batch_size = 8;
     const int d_model = num_layers * 64;
     const int hidden_dim = d_model * 4;
     float learning_rate = 0.0001f;
@@ -174,18 +175,18 @@ int main(int argc, char* argv[]) {
     printf("Parameters: ~%.1fM\n", (float)(gpt->vocab_size * gpt->d_model + gpt->transformer->num_layers * ((size_t)4 * gpt->d_model * gpt->d_model + gpt->d_model * gpt->transformer->mlp_layers[0]->hidden_dim + gpt->transformer->mlp_layers[0]->hidden_dim * gpt->d_model)) / 1e6f);
     
     // Create shuffled indices for random sampling without replacement
-    size_t total_sequences = (get_file_size(corpus_path) - 2) / (2 * seq_len);
+    size_t total_sequences = (get_file_size(corpus_path) - 1) / seq_len;
     size_t* shuffled_indices = create_shuffled_indices(total_sequences);
     
     // Allocate host buffers for sequences
-    size_t sequences_per_chunk = (128 * 1024 * 1024) / (seq_len * 2);
-    unsigned short* input_tokens = (unsigned short*)malloc(sequences_per_chunk * seq_len * sizeof(unsigned short));
-    unsigned short* target_tokens = (unsigned short*)malloc(sequences_per_chunk * seq_len * sizeof(unsigned short));
+    size_t sequences_per_chunk = (4 * 1024 * 1024) / seq_len;
+    unsigned char* input_tokens = (unsigned char*)malloc(sequences_per_chunk * seq_len * sizeof(unsigned char));
+    unsigned char* target_tokens = (unsigned char*)malloc(sequences_per_chunk * seq_len * sizeof(unsigned char));
     
     // Allocate device buffers
-    unsigned short *d_input_tokens, *d_target_tokens;
-    CHECK_CUDA(cudaMalloc(&d_input_tokens, batch_size * seq_len * sizeof(unsigned short)));
-    CHECK_CUDA(cudaMalloc(&d_target_tokens, batch_size * seq_len * sizeof(unsigned short)));
+    unsigned char *d_input_tokens, *d_target_tokens;
+    CHECK_CUDA(cudaMalloc(&d_input_tokens, batch_size * seq_len * sizeof(unsigned char)));
+    CHECK_CUDA(cudaMalloc(&d_target_tokens, batch_size * seq_len * sizeof(unsigned char)));
     
     // Calculate starting position based on training progress
     size_t start_chunk = 0;
@@ -214,15 +215,15 @@ int main(int argc, char* argv[]) {
             struct timespec start; clock_gettime(CLOCK_MONOTONIC, &start);
             
             // Copy batch to device
-            CHECK_CUDA(cudaMemcpy(d_input_tokens, &input_tokens[batch * batch_size * seq_len], batch_size * seq_len * sizeof(unsigned short), cudaMemcpyHostToDevice));
-            CHECK_CUDA(cudaMemcpy(d_target_tokens, &target_tokens[batch * batch_size * seq_len], batch_size * seq_len * sizeof(unsigned short), cudaMemcpyHostToDevice));
+            CHECK_CUDA(cudaMemcpy(d_input_tokens, &input_tokens[batch * batch_size * seq_len], batch_size * seq_len * sizeof(unsigned char), cudaMemcpyHostToDevice));
+            CHECK_CUDA(cudaMemcpy(d_target_tokens, &target_tokens[batch * batch_size * seq_len], batch_size * seq_len * sizeof(unsigned char), cudaMemcpyHostToDevice));
             
             // Forward pass
             forward_pass_gpt(gpt, d_input_tokens);
             
             // Calculate loss
             float loss = calculate_loss_gpt(gpt, d_target_tokens);
-            if (loss >= 12.0) raise(SIGINT);
+            if (loss >= 6.0) raise(SIGINT);
             
             // Backward pass
             if (batch % accum_steps == 0) zero_gradients_gpt(gpt);
@@ -238,20 +239,20 @@ int main(int argc, char* argv[]) {
                     chunk_idx, total_sequences / sequences_per_chunk, batch, (int)(sequences_per_chunk / batch_size),
                     loss, lr, ((end.tv_sec - start.tv_sec) * 1000.0 + (end.tv_nsec - start.tv_nsec) / 1e6),
                     (batch_size * seq_len) / ((end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9),
-                    loss / log(2.0) / 2.0,
+                    loss / log(2.0),
                     ((double)total_sequences / batch_size - (chunk_idx * (sequences_per_chunk / batch_size) + batch) - 1) * ((end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9) / 3600.0);
             }
         }
         
         // Generate sample text
         printf("\n--- Sample ---\n");
-        generate_text(gpt, 0.001f, d_input_tokens, "<|bos|>The capital of France is", 64);
-        generate_text(gpt, 0.001f, d_input_tokens, "<|bos|>The chemical symbol of gold is", 64);
-        generate_text(gpt, 0.001f, d_input_tokens, "<|bos|>If yesterday was Friday, then tomorrow will be", 64);
-        generate_text(gpt, 0.001f, d_input_tokens, "<|bos|>The opposite of hot is", 64);
-        generate_text(gpt, 0.001f, d_input_tokens, "<|bos|>The planets of the solar system are:", 64);
-        generate_text(gpt, 0.001f, d_input_tokens, "<|bos|>My favorite color is", 64);
-        generate_text(gpt, 0.001f, d_input_tokens, "<|bos|>If 5*x + 3 = 13, then x is", 64);
+        generate_text(gpt, 0.001f, d_input_tokens, "Once upon a time, there was a", 64);
+        generate_text(gpt, 0.001f, d_input_tokens, "Lily and Tom were playing in the", 64);
+        generate_text(gpt, 0.001f, d_input_tokens, "One day, a little girl named", 64);
+        generate_text(gpt, 0.001f, d_input_tokens, "The big dog ran to the", 64);
+        generate_text(gpt, 0.001f, d_input_tokens, "\"Hello!\" said the", 64);
+        generate_text(gpt, 0.001f, d_input_tokens, "Once upon a time, in a", 64);
+        generate_text(gpt, 0.001f, d_input_tokens, "Tim was very", 64);
         printf("--- End ---\n\n");
         
         // Save checkpoint

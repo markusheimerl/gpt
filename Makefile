@@ -4,7 +4,7 @@ LDFLAGS = -lopenblas -lm -flto
 
 ARCH ?= sm_86
 CUDAFLAGS = --cuda-gpu-arch=$(ARCH) -x cuda
-CUDALIBS = -L/usr/local/cuda/lib64 -lcudart -lcublasLt
+CUDALIBS = -lcudart -lcublasLt
 
 train.out: gpt.o transformer/transformer.o transformer/attention/attention.o transformer/mlp/mlp.o train.o
 	$(CC) gpt.o transformer/transformer.o transformer/attention/attention.o transformer/mlp/mlp.o train.o $(CUDALIBS) $(LDFLAGS) -o $@
@@ -24,10 +24,13 @@ transformer/mlp/mlp.o:
 train.o: train.c gpt.h
 	$(CC) $(CFLAGS) $(CUDAFLAGS) -c train.c -o $@
 
-run: train.out
+data:
+	@test -f corpus.txt || curl -L -o corpus.txt https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/TinyStoriesV2-GPT4-train.txt
+
+run: train.out data
 	@time ./train.out corpus.txt
 
-cont: train.out
+cont: train.out data
 	@time ./train.out corpus.txt $$(ls -t *_gpt.bin 2>/dev/null | head -n1)
 
 clean:
