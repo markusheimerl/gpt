@@ -6,11 +6,11 @@ ARCH ?= sm_86
 CUDAFLAGS = --cuda-path=/usr/lib/cuda --cuda-gpu-arch=$(ARCH) -x cuda
 CUDALIBS = -L/usr/lib/x86_64-linux-gnu -lcudart -lcublasLt
 
-tokenize.out: tokenize.c
-	$(CC) $(CFLAGS) tokenize.c -o $@
+data.out: data.c
+	$(CC) $(CFLAGS) data.c -o $@
 
-tokenize: tokenize.out
-	@./tokenize.out
+data: data.out
+	@./data.out
 
 train.out: gpt.o transformer/transformer.o transformer/attention/attention.o transformer/mlp/mlp.o train.o
 	$(CC) gpt.o transformer/transformer.o transformer/attention/attention.o transformer/mlp/mlp.o train.o $(CUDALIBS) $(LDFLAGS) -o $@
@@ -31,31 +31,32 @@ train.o: train.c gpt.h
 	$(CC) $(CFLAGS) $(CUDAFLAGS) -c train.c -o $@
 
 train: train.out
-	@time ./train.out corpus.txt.bin
+	@time ./train.out corpus.bin
 
 cont: train.out
-	@time ./train.out corpus.txt.bin $$(ls -t *_gpt.bin 2>/dev/null | head -n1)
-
-trim.out: trim.c
-	$(CC) $(CFLAGS) trim.c -o trim.out
-
-trim: trim.out
-	@./trim.out $$(ls -t *_gpt.bin 2>/dev/null | grep -v "_trim" | head -n1)
+	@time ./train.out corpus.bin $$(ls -t *_gpt.bin 2>/dev/null | head -n1)
 
 infer.out: infer.c
 	$(CC) $(CFLAGS) infer.c -lopenblas -lm -o infer.out
 
 infer: infer.out
-	@./infer.out $$(ls -t *_gpt_trim.bin 2>/dev/null | head -n1)
+	@./infer.out $$(ls -t *_gpt.bin 2>/dev/null | head -n1)
 
-server.out: server.c
-	$(CC) $(CFLAGS) server.c -lopenblas -lm -lpthread -o server.out
-
-server: server.out
-	@./server.out $$(ls -t *_gpt_trim.bin 2>/dev/null | head -n1)
+# Usage: make play <file.mid>
+# e.g.   make play out.mid
+#        make play sample_e00_c000.mid
+PLAY_ARGS := $(filter-out play,$(MAKECMDGOALS))
+play:
+	@if [ -z "$(PLAY_ARGS)" ]; then \
+		echo "usage: make play <file.mid>"; exit 1; \
+	fi; \
+	timidity "$(PLAY_ARGS)"
+# Swallow the filename arg so make doesn't try to build it as a target.
+%:
+	@:
 
 clean:
-	rm -f *.out *.o *.csv
+	rm -f *.out *.o *.csv *.mid
 	$(MAKE) -C transformer/ clean
 	$(MAKE) -C transformer/attention/ clean
 	$(MAKE) -C transformer/mlp/ clean

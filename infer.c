@@ -7,112 +7,7 @@
 #include <stdbool.h>
 #include <cblas.h>
 
-#define SPM_ENCODE "sentencepiece/build/src/spm_encode"
-#define SPM_DECODE "sentencepiece/build/src/spm_decode"
-#define SPM_MODEL  "spm_model.model"
-
-// ============================================================================
-// Tokenisation via spm_encode / spm_decode (BPE)
-// ============================================================================
-
-/* Encode text → token ids.  Returns number of tokens written into out[]. */
-static int spm_encode(const char* text, unsigned short* out, int max_tokens) {
-    FILE* f = fopen("/tmp/infer_in.txt", "w");
-    if (!f) return 0;
-    fprintf(f, "%s\n", text);
-    fclose(f);
-
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-             "%s --model=%s --output_format=id < /tmp/infer_in.txt",
-             SPM_ENCODE, SPM_MODEL);
-    FILE* p = popen(cmd, "r");
-    if (!p) return 0;
-
-    int n = 0;
-    char line[65536];
-    while (fgets(line, sizeof(line), p) && n < max_tokens) {
-        char* ptr = line, *ep;
-        while (*ptr) {
-            while (*ptr == ' ' || *ptr == '\t' || *ptr == '\n' || *ptr == '\r') ptr++;
-            if (!*ptr) break;
-            long id = strtol(ptr, &ep, 10);
-            if (ep == ptr) break;
-            ptr = ep;
-            if (n < max_tokens) out[n++] = (unsigned short)(id & 0xFFFF);
-        }
-    }
-    pclose(p);
-    return n;
-}
-
-/* Decode a sequence of token ids to text (returned in caller-supplied buf). */
-static void spm_decode_ids(const unsigned short* ids, int n, char* buf, int bufsz) {
-    buf[0] = '\0';
-    if (n <= 0) return;
-
-    FILE* f = fopen("/tmp/infer_ids.txt", "w");
-    if (!f) return;
-    for (int i = 0; i < n; i++) fprintf(f, i ? " %hu" : "%hu", ids[i]);
-    fprintf(f, "\n");
-    fclose(f);
-
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-             "%s --model=%s --input_format=id < /tmp/infer_ids.txt",
-             SPM_DECODE, SPM_MODEL);
-    FILE* p = popen(cmd, "r");
-    if (!p) return;
-    if (fgets(buf, bufsz, p)) {
-        int l = (int)strlen(buf);
-        if (l > 0 && buf[l-1] == '\n') buf[l-1] = '\0';
-    }
-    pclose(p);
-}
-
-/*
- * Streaming token printer.
- * We decode [anchor_id, ...generated_so_far, new_id] and print only the
- * suffix that wasn't there before, using the same trick as train.c.
- */
-typedef struct {
-    unsigned short anchor;          /* last prompt token — decoder boundary */
-    unsigned short gen[2048];       /* generated tokens so far              */
-    int            n_gen;
-    char           prev[65536];     /* text decoded last iteration           */
-    bool           first;
-} StreamState;
-
-static void stream_init(StreamState* s, unsigned short anchor_tok) {
-    s->anchor = anchor_tok;
-    s->n_gen  = 0;
-    s->first  = true;
-    s->prev[0] = '\0';
-    /* Prime prev with the anchor decoded alone. */
-    spm_decode_ids(&anchor_tok, 1, s->prev, sizeof(s->prev));
-}
-
-static void stream_push(StreamState* s, unsigned short tok) {
-    if (s->n_gen >= (int)(sizeof(s->gen)/sizeof(s->gen[0]))) return;
-    s->gen[s->n_gen++] = tok;
-
-    /* Build id list: anchor + all generated */
-    unsigned short tmp[2049];
-    tmp[0] = s->anchor;
-    memcpy(tmp + 1, s->gen, s->n_gen * sizeof(unsigned short));
-
-    char curr[65536];
-    spm_decode_ids(tmp, s->n_gen + 1, curr, sizeof(curr));
-
-    /* Print only the new suffix */
-    size_t prev_len = strlen(s->prev);
-    if (strlen(curr) > prev_len)
-        fputs(curr + prev_len, stdout);
-    fflush(stdout);
-
-    strcpy(s->prev, curr);
-    s->first = false;
-}
+#include "tokens.h"
 
 // ============================================================================
 // Model structures
@@ -357,7 +252,7 @@ static Transformer* transformer_deserialize(FILE* f, int seq_len) {
 // GPT
 // ============================================================================
 
-static void gpt_forward(GPT* gpt, unsigned short token, int pos) {
+static void gpt_forward(GPT* gpt, unsigned char token, int pos) {
     int d = gpt->d_model;
     memcpy(gpt->x, gpt->token_embedding + (size_t)token * d, d * sizeof(float));
     transformer_forward(gpt->transformer, gpt->x, pos);
@@ -410,7 +305,7 @@ static void gpt_free(GPT* gpt) {
 // Sampling
 // ============================================================================
 
-static unsigned short sample(float* logits, int vocab_size, float temperature) {
+static unsigned char sample(float* logits, int vocab_size, float temperature) {
     float max_l = -1e30f;
     for (int v = 0; v < vocab_size; v++) {
         logits[v] /= temperature;
@@ -424,171 +319,81 @@ static unsigned short sample(float* logits, int vocab_size, float temperature) {
     float r = (float)rand() / (float)RAND_MAX, cumsum = 0.0f;
     for (int v = 0; v < vocab_size; v++) {
         cumsum += logits[v] / sum;
-        if (r <= cumsum) return (unsigned short)v;
+        if (r <= cumsum) return (unsigned char)v;
     }
-    return (unsigned short)(vocab_size - 1);
-}
-
-// ============================================================================
-// Generation
-// ============================================================================
-
-/*
- * Prefill pos starting at *pos_inout, feeding every token in the prompt
- * one-by-one into the KV-cache.  Returns the position of the last token
- * processed (whose logits are ready in gpt->logits).
- */
-static int prefill(GPT* gpt, const char* text,
-                   unsigned short* ctx, int pos) {
-    unsigned short buf[512];
-    int room = gpt->seq_len - pos - 2 - 256;
-    if (room <= 0) return pos;
-    int n = spm_encode(text, buf, room < 512 ? room : 512);
-    for (int i = 0; i < n && pos < gpt->seq_len - 1; i++) {
-        pos++;
-        ctx[pos] = buf[i];
-        gpt_forward(gpt, buf[i], pos);
-    }
-    return pos;
-}
-
-/*
- * Greedy/temperature-sampled autoregressive generation.
- * Returns final context position.
- */
-static int generate(GPT* gpt, unsigned short* ctx, int pos,
-                    float temperature, int max_new,
-                    unsigned short bos_tok, unsigned short user_tok) {
-    /* Use the last prompt token as the decoder anchor for streaming. */
-    StreamState ss;
-    stream_init(&ss, ctx[pos]);
-
-    for (int i = 0; i < max_new && pos < gpt->seq_len - 1; i++) {
-        unsigned short next = sample(gpt->logits, gpt->vocab_size, temperature);
-        /* Stop at BOS or <|user|> — signals end of assistant turn */
-        if (next == bos_tok || next == user_tok) break;
-        stream_push(&ss, next);
-        pos++;
-        ctx[pos] = next;
-        gpt_forward(gpt, next, pos);
-    }
-    printf("\n");
-    return pos;
-}
-
-// ============================================================================
-// Special-token lookup via spm_encode
-// ============================================================================
-
-static unsigned short find_special(const char* text) {
-    unsigned short buf[4];
-    int n = spm_encode(text, buf, 4);
-    return (n > 0) ? buf[0] : 0xFFFF;
+    return (unsigned char)(vocab_size - 1);
 }
 
 // ============================================================================
 // Globals for signal handler
 // ============================================================================
 
-static GPT*           g_gpt     = NULL;
-static unsigned short* g_ctx    = NULL;
-static bool            g_interactive = true;
+static GPT*            g_gpt = NULL;
+static unsigned char*  g_ctx = NULL;
 
 static void on_sigint(int sig) {
     (void)sig;
-    if (g_interactive) printf("\n\nExiting...\n");
+    fprintf(stderr, "\n\nExiting...\n");
     gpt_free(g_gpt);
     free(g_ctx);
     exit(0);
 }
 
 // ============================================================================
-// Main
+// Main: load model, seed with one VELOCITY token, sample event tokens,
+//       write a .mid file via the detokenizer in tokens.h.
 // ============================================================================
 
 int main(int argc, char* argv[]) {
-    srand((unsigned)time(NULL));
     signal(SIGINT, on_sigint);
-    // openblas_set_num_threads(6);
 
-    const int   SEQ_LEN     = 512;
-    const float TEMPERATURE = 0.7f;
-    const int   MAX_NEW     = 256;
+    int   seq_len     = 512;
+    float temperature = 1.0f;
+    int   n_tokens    = 1024;
+    const char* out_path = "out.mid";
+    unsigned seed = (unsigned)time(NULL);
+    const char* model_path = "checkpoint_gpt.bin";
 
-    /* Argument parsing: optional model path, then optional prompt words */
-    int arg_offset = 1;
-    const char* model_path = "checkpoint_gpt_trim.bin";
-    if (argc > 1 && strstr(argv[1], ".bin")) {
-        model_path = argv[1];
-        arg_offset = 2;
+    for (int i = 1; i < argc; i++) {
+        if      (strncmp(argv[i], "--temperature=", 14) == 0) temperature = (float)atof(argv[i] + 14);
+        else if (strncmp(argv[i], "--tokens=",       9) == 0) n_tokens    = atoi(argv[i] + 9);
+        else if (strncmp(argv[i], "--out=",          6) == 0) out_path    = argv[i] + 6;
+        else if (strncmp(argv[i], "--seed=",         7) == 0) seed        = (unsigned)atoi(argv[i] + 7);
+        else if (strncmp(argv[i], "--seq_len=",     10) == 0) seq_len     = atoi(argv[i] + 10);
+        else if (strstr(argv[i], ".bin"))                     model_path  = argv[i];
+        else {
+            fprintf(stderr, "usage: %s [model.bin] [--temperature=X] [--tokens=N] [--out=path.mid] [--seed=S]\n", argv[0]);
+            return 1;
+        }
     }
+    srand(seed);
 
-    g_gpt = gpt_load(model_path, SEQ_LEN);
+    g_gpt = gpt_load(model_path, seq_len);
     if (!g_gpt) return 1;
+    g_ctx = calloc(seq_len, sizeof(unsigned char));
 
-    g_ctx = calloc(SEQ_LEN, sizeof(unsigned short));
+    if (n_tokens > seq_len - 1) n_tokens = seq_len - 1;
 
-    /* Discover special tokens at runtime via the BPE model */
-    unsigned short tok_bos  = find_special("<|bos|>");
-    unsigned short tok_user = find_special("<|user|>");
-    fprintf(stderr, "Special tokens: bos=%hu  user=%hu\n", tok_bos, tok_user);
+    /* Seed with a single mid-range VELOCITY token. */
+    int prompt_len = 1;
+    g_ctx[0] = (unsigned char)(TOK_VEL_BASE + NUM_VEL_BINS / 2);
+    gpt_forward(g_gpt, g_ctx[0], 0);
 
-    // ── Non-interactive: prompt from CLI args ─────────────────────────────
-    if (argc > arg_offset) {
-        g_interactive = false;
+    fprintf(stderr, "Sampling %d tokens (T=%.2f, seed=%u) -> %s\n",
+            n_tokens, temperature, seed, out_path);
 
-        char question[4096] = {0};
-        for (int i = arg_offset; i < argc; i++) {
-            if (i > arg_offset) strcat(question, " ");
-            strncat(question, argv[i], sizeof(question) - strlen(question) - 1);
-        }
-        char turn[4096];
-        snprintf(turn, sizeof(turn),
-                 "<|bos|><|user|>\n%s\n<|assistant|>\n", question);
-
-        int pos = prefill(g_gpt, turn, g_ctx, -1);
-        generate(g_gpt, g_ctx, pos, TEMPERATURE, MAX_NEW, tok_bos, tok_user);
-
-        gpt_free(g_gpt); free(g_ctx);
-        return 0;
+    for (int pos = prompt_len; pos < n_tokens; pos++) {
+        unsigned char next = sample(g_gpt->logits, g_gpt->vocab_size, temperature);
+        g_ctx[pos] = next;
+        gpt_forward(g_gpt, next, pos);
+        if ((pos & 0x7F) == 0) { fprintf(stderr, "."); fflush(stderr); }
     }
+    fprintf(stderr, "\n");
 
-    // ── Interactive multi-turn chat ───────────────────────────────────────
-    int  pos        = -1;
-    bool first_turn = true;
-    char question[4096];
+    write_midi_from_tokens(out_path, g_ctx, n_tokens);
+    fprintf(stderr, "Wrote %s (%d tokens)\n", out_path, n_tokens);
 
-    while (1) {
-        printf("\n\033[1;36m?\033[0m ");
-        fflush(stdout);
-        if (!fgets(question, sizeof(question), stdin)) break;
-        question[strcspn(question, "\n")] = '\0';
-        if (!strlen(question)) continue;
-
-        /* Reset context if we're running out of room */
-        if (g_gpt->seq_len - pos < 300) {
-            fprintf(stderr, "\n[Context full — resetting]\n");
-            pos = -1; first_turn = true;
-        }
-
-        char turn[4096];
-        if (first_turn) {
-            snprintf(turn, sizeof(turn),
-                     "<|bos|><|user|>\n%s\n<|assistant|>\n", question);
-            first_turn = false;
-        } else {
-            snprintf(turn, sizeof(turn),
-                     "<|user|>\n%s\n<|assistant|>\n", question);
-        }
-
-        pos = prefill(g_gpt, turn, g_ctx, pos);
-
-        printf("\033[1;32m>\033[0m ");
-        fflush(stdout);
-
-        pos = generate(g_gpt, g_ctx, pos, TEMPERATURE, MAX_NEW, tok_bos, tok_user);
-    }
-
-    on_sigint(0);
+    gpt_free(g_gpt);
+    free(g_ctx);
     return 0;
 }
