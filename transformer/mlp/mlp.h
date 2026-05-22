@@ -33,6 +33,21 @@
 } while(0)
 #endif
 
+// cuBLASLt matrix multiplication macro
+#ifndef LT_MATMUL
+#define LT_MATMUL(mlp, opA, opB, alpha, A, layA, B, layB, beta, C, layC) do { \
+    cublasOperation_t _opA = opA, _opB = opB; \
+    CHECK_CUBLASLT(cublasLtMatmulDescSetAttribute(mlp->matmul_desc, \
+                   CUBLASLT_MATMUL_DESC_TRANSA, &_opA, sizeof(_opA))); \
+    CHECK_CUBLASLT(cublasLtMatmulDescSetAttribute(mlp->matmul_desc, \
+                   CUBLASLT_MATMUL_DESC_TRANSB, &_opB, sizeof(_opB))); \
+    CHECK_CUBLASLT(cublasLtMatmul(mlp->cublaslt_handle, mlp->matmul_desc, \
+                                  alpha, A, layA, B, layB, \
+                                  beta, C, layC, \
+                                  C, layC, NULL, NULL, 0, 0)); \
+} while(0)
+#endif
+
 typedef struct {
     // Weights and gradients
     half* d_W1;      // [input_dim x hidden_dim]

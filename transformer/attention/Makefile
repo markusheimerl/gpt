@@ -1,10 +1,10 @@
 CC = clang
-CFLAGS = -O3 -march=native -ffast-math -Wall -Wextra -Wno-unknown-cuda-version
+CFLAGS = -O3 -march=native -ffast-math -Wall -Wextra
 LDFLAGS = -lopenblas -lm -flto
 
 ARCH ?= sm_86
-CUDAFLAGS = --cuda-path=/usr/lib/cuda --cuda-gpu-arch=$(ARCH) -x cuda
-CUDALIBS = -L/usr/lib/x86_64-linux-gnu -lcudart -lcublasLt
+CUDAFLAGS = --cuda-gpu-arch=$(ARCH) -x cuda
+CUDALIBS = -L/usr/local/cuda/lib64 -lcudart -lcublasLt
 
 test.out: attention.o test.o
 	$(CC) attention.o test.o $(CUDALIBS) $(LDFLAGS) -o $@

@@ -1,18 +1,5 @@
 #include "gpt.h"
 
-// cuBLASLt matrix multiplication macro
-#define LT_MATMUL(obj, opA, opB, alpha, A, layA, B, layB, beta, C, layC) do { \
-    cublasOperation_t _opA = opA, _opB = opB; \
-    CHECK_CUBLASLT(cublasLtMatmulDescSetAttribute((obj)->matmul_desc, \
-                   CUBLASLT_MATMUL_DESC_TRANSA, &_opA, sizeof(_opA))); \
-    CHECK_CUBLASLT(cublasLtMatmulDescSetAttribute((obj)->matmul_desc, \
-                   CUBLASLT_MATMUL_DESC_TRANSB, &_opB, sizeof(_opB))); \
-    CHECK_CUBLASLT(cublasLtMatmul((obj)->cublaslt_handle, (obj)->matmul_desc, \
-                                  alpha, A, layA, B, layB, \
-                                  beta, C, layC, \
-                                  C, layC, NULL, NULL, 0, 0)); \
-} while(0)
-
 // Initialize the GPT
 GPT* init_gpt(int seq_len, int d_model, int hidden_dim, int num_layers, int batch_size, cublasLtHandle_t cublaslt_handle) {
     GPT* gpt = (GPT*)malloc(sizeof(GPT));
@@ -23,7 +10,7 @@ GPT* init_gpt(int seq_len, int d_model, int hidden_dim, int num_layers, int batc
     gpt->batch_size = batch_size;
     gpt->hidden_dim = hidden_dim;
     gpt->num_layers = num_layers;
-    gpt->vocab_size = 256;
+    gpt->vocab_size = 65536;
     gpt->cublaslt_handle = cublaslt_handle;
     
     // Initialize Adam parameters
@@ -130,7 +117,7 @@ void free_gpt(GPT* gpt) {
 }
 
 // CUDA kernel for token embedding lookup
-__global__ static void token_embedding_lookup_kernel(half* embedded, half* token_embedding, unsigned char* tokens, int batch_size, int seq_len, int d_model) {
+__global__ static void token_embedding_lookup_kernel(half* embedded, half* token_embedding, unsigned short* tokens, int batch_size, int seq_len, int d_model) {
     int b = blockIdx.x;
     int t = blockIdx.y;
     
@@ -152,7 +139,7 @@ __global__ extern void rmsnorm_forward_kernel(half* output, const half* input, i
 __global__ extern void rmsnorm_backward_kernel(half* grad_input, const half* grad_output, const half* input, int batch_size, int seq_len, int d_model);
 
 // CUDA kernel for token embedding gradient accumulation
-__global__ static void token_embedding_grad_kernel(half* token_embedding_grad, half* grad_embedded, unsigned char* tokens, int batch_size, int seq_len, int d_model) {
+__global__ static void token_embedding_grad_kernel(half* token_embedding_grad, half* grad_embedded, unsigned short* tokens, int batch_size, int seq_len, int d_model) {
     int b = blockIdx.x;
     int t = blockIdx.y;
     
@@ -169,7 +156,7 @@ __global__ static void token_embedding_grad_kernel(half* token_embedding_grad, h
 }
 
 // CUDA kernel for softmax and cross-entropy loss computation
-__global__ static void softmax_cross_entropy_kernel(float* loss_result, half* grad_logits, half* logits, unsigned char* targets, int batch_size, int seq_len, int vocab_size) {
+__global__ static void softmax_cross_entropy_kernel(float* loss_result, half* grad_logits, half* logits, unsigned short* targets, int batch_size, int seq_len, int vocab_size) {
     extern __shared__ float smem[];
     
     int b = blockIdx.x;
@@ -236,7 +223,7 @@ __global__ static void softmax_cross_entropy_kernel(float* loss_result, half* gr
 }
 
 // Forward pass
-void forward_pass_gpt(GPT* gpt, unsigned char* d_input_tokens) {
+void forward_pass_gpt(GPT* gpt, unsigned short* d_input_tokens) {
     const float alpha = 1.0f;
     const float beta = 0.0f;
     
@@ -267,7 +254,7 @@ void forward_pass_gpt(GPT* gpt, unsigned char* d_input_tokens) {
 }
 
 // Calculate loss
-float calculate_loss_gpt(GPT* gpt, unsigned char* d_target_tokens) {
+float calculate_loss_gpt(GPT* gpt, unsigned short* d_target_tokens) {
     // Reset loss accumulator
     CHECK_CUDA(cudaMemset(gpt->d_loss_result, 0, sizeof(float)));
     
@@ -295,7 +282,7 @@ void zero_gradients_gpt(GPT* gpt) {
 }
 
 // Backward pass
-void backward_pass_gpt(GPT* gpt, unsigned char* d_input_tokens) {
+void backward_pass_gpt(GPT* gpt, unsigned short* d_input_tokens) {
     const float alpha = 1.0f;
     const float beta = 0.0f;
     

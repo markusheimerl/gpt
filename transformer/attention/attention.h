@@ -34,6 +34,21 @@
 } while(0)
 #endif
 
+// cuBLASLt matrix multiplication macro
+#ifndef LT_MATMUL
+#define LT_MATMUL(attn, opA, opB, alpha, A, layA, B, layB, beta, C, layC) do { \
+    cublasOperation_t _opA = opA, _opB = opB; \
+    CHECK_CUBLASLT(cublasLtMatmulDescSetAttribute(attn->matmul_desc, \
+                   CUBLASLT_MATMUL_DESC_TRANSA, &_opA, sizeof(_opA))); \
+    CHECK_CUBLASLT(cublasLtMatmulDescSetAttribute(attn->matmul_desc, \
+                   CUBLASLT_MATMUL_DESC_TRANSB, &_opB, sizeof(_opB))); \
+    CHECK_CUBLASLT(cublasLtMatmul(attn->cublaslt_handle, attn->matmul_desc, \
+                                  alpha, A, layA, B, layB, \
+                                  beta, C, layC, \
+                                  C, layC, NULL, NULL, 0, 0)); \
+} while(0)
+#endif
+
 typedef struct {
     // Device weights for attention mechanism
     half* d_W_q;      // Query projection [d_model x d_model]

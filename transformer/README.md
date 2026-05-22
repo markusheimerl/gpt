@@ -55,11 +55,8 @@ $$
 The implementation leverages BLAS for matrix operations, enabling efficient computation on modern hardware.
 
 ## How to run
-### Ubuntu
-```bash
+```
 sudo apt update
-sudo apt install -y clang make time libopenblas-dev nvidia-cuda-toolkit git
-sudo reboot
-git clone https://github.com/markusheimerl/gpt && cd gpt/transformer/
-make run -j 6
+sudo apt install clang time libopenblas-dev
+make run
 ```

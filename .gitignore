@@ -53,8 +53,5 @@ dkms.conf
 
 *.txt
 *.bin
-*.vocab
-screenlog*
-*.chunk*
 *.csv
-*.mid
+screenlog*
