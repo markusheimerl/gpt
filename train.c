@@ -159,7 +159,7 @@ int main(int argc, char* argv[]) {
     // Model hyperparameters
     const int seq_len = 1024;
     const int num_layers = 16;
-    const int batch_size = 8;
+    const int batch_size = 10;
     const int d_model = num_layers * 64;
     const int hidden_dim = d_model * 4;
     float learning_rate = 0.0001f;
