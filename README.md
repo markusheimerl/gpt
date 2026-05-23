@@ -18,7 +18,6 @@ The implementation uses BLAS (Basic Linear Algebra Subprograms) for efficient ma
 ```bash
 sudo apt update
 sudo apt install -y clang make time libopenblas-dev nvidia-cuda-toolkit git curl
-sudo reboot
 git clone https://github.com/markusheimerl/gpt && cd gpt/
 make data
 make run -j 6
