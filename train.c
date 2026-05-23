@@ -159,9 +159,9 @@ int main(int argc, char* argv[]) {
     // Model hyperparameters
     const int seq_len = 1024;
     const int num_layers = 16;
-    const int batch_size = 10;
-    const int d_model = num_layers * 64;
-    const int hidden_dim = d_model * 4;
+    const int batch_size = 15;
+    const int d_model = num_layers * 32;
+    const int hidden_dim = d_model * 2;
     float learning_rate = 0.0001f;
     const int accum_steps = 1;
     
@@ -231,7 +231,7 @@ int main(int argc, char* argv[]) {
             
             // Update weights with cosine learning rate schedule
             if ((batch + 1) % accum_steps == 0) {
-                float lr = learning_rate * fminf(1.0f, (float)(chunk_idx * (sequences_per_chunk / batch_size) + batch) / 1000.0f) * (0.1f + 0.45f * (1.0f + cosf(M_PI * ((float)(chunk_idx * (sequences_per_chunk / batch_size) + batch) / (float)(total_sequences / batch_size)))));
+                float lr = learning_rate * fminf(1.0f, (float)(chunk_idx * (sequences_per_chunk / batch_size) + batch) / 100.0f) * (0.1f + 0.45f * (1.0f + cosf(M_PI * ((float)(chunk_idx * (sequences_per_chunk / batch_size) + batch) / (float)(total_sequences / batch_size)))));
                 update_weights_gpt(gpt, lr, batch_size * accum_steps);
 
                 CHECK_CUDA(cudaDeviceSynchronize()); struct timespec end; clock_gettime(CLOCK_MONOTONIC, &end);
@@ -246,13 +246,13 @@ int main(int argc, char* argv[]) {
         
         // Generate sample text
         printf("\n--- Sample ---\n");
-        generate_text(gpt, 0.001f, d_input_tokens, "Once upon a time, there was a", 64);
-        generate_text(gpt, 0.001f, d_input_tokens, "Lily and Tom were playing in the", 64);
-        generate_text(gpt, 0.001f, d_input_tokens, "One day, a little girl named", 64);
-        generate_text(gpt, 0.001f, d_input_tokens, "The big dog ran to the", 64);
-        generate_text(gpt, 0.001f, d_input_tokens, "\"Hello!\" said the", 64);
-        generate_text(gpt, 0.001f, d_input_tokens, "Once upon a time, in a", 64);
-        generate_text(gpt, 0.001f, d_input_tokens, "Tim was very", 64);
+        generate_text(gpt, 0.001f, d_input_tokens, "Once upon a time, there was a", 256);
+        generate_text(gpt, 0.001f, d_input_tokens, "Lily and Tom were playing in the", 256);
+        generate_text(gpt, 0.001f, d_input_tokens, "One day, a little girl named", 256);
+        generate_text(gpt, 0.001f, d_input_tokens, "The big dog ran to the", 256);
+        generate_text(gpt, 0.001f, d_input_tokens, "\"Hello!\" said the", 256);
+        generate_text(gpt, 0.001f, d_input_tokens, "Once upon a time, in a", 256);
+        generate_text(gpt, 0.001f, d_input_tokens, "Tim was very", 256);
         printf("--- End ---\n\n");
         
         // Save checkpoint
