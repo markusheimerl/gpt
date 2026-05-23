@@ -245,15 +245,22 @@ int main(int argc, char* argv[]) {
         }
         
         // Generate sample text
-        printf("\n--- Sample ---\n");
-        generate_text(gpt, 0.001f, d_input_tokens, "Once upon a time, there was a", 256);
-        generate_text(gpt, 0.001f, d_input_tokens, "Lily and Tom were playing in the", 256);
-        generate_text(gpt, 0.001f, d_input_tokens, "One day, a little girl named", 256);
-        generate_text(gpt, 0.001f, d_input_tokens, "The big dog ran to the", 256);
-        generate_text(gpt, 0.001f, d_input_tokens, "\"Hello!\" said the", 256);
-        generate_text(gpt, 0.001f, d_input_tokens, "Once upon a time, in a", 256);
-        generate_text(gpt, 0.001f, d_input_tokens, "Tim was very", 256);
-        printf("--- End ---\n\n");
+        const char* prompts[] = {
+            "Once upon a time, there was a",
+            "Lily and Tom were playing in the",
+            "One day, a little girl named",
+            "The big dog ran to the",
+            "\"Hello!\" said the",
+            "Once upon a time, in a",
+            "Tim was very",
+        };
+        int num_prompts = sizeof(prompts) / sizeof(prompts[0]);
+        printf("\n");
+        for (int p = 0; p < num_prompts; p++) {
+            printf("--- Sample %d/%d ---\n", p + 1, num_prompts);
+            generate_text(gpt, 0.001f, d_input_tokens, prompts[p], 256);
+            printf("\n");
+        }
         
         // Save checkpoint
         save_gpt(gpt, "checkpoint_gpt.bin");
