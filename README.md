@@ -20,5 +20,33 @@ sudo apt update
 sudo apt install -y clang make time libopenblas-dev nvidia-cuda-toolkit git curl
 sudo reboot
 git clone https://github.com/markusheimerl/gpt && cd gpt/
+make data
 make run -j 6
+make infer
+```
+
+## Sample outputs
+After one night of training on a laptop RTX 3080 (16 GB), prompted with `"Once upon a time, there was a"`:
+
+```
+Once upon a time, there was a big, round ball standing in the park. The ball
+was very happy and started to roll all around. It was so much fun!
+The ball rolled faster and faster than ever before. It was a lot of fun, but
+it was also very tough. As the ball rolled, it started to get dizzy. The ball
+did not know why, but it got louder and louder.
+Suddenly, the ball rolled out of the bushes and it stopped rolling. The ball
+was sad and didn't know what to do. It didn't know how to roll around anymore
+because it was a ball. The ball was sor
+```
+
+```
+Once upon a time, there was a little girl named Sue. She had a big room with
+many toys. Sue liked to play in her room every day. She thought it was fun to
+wear a pretty dress and shiny shoes.
+One day, Sue went to play with her friend Tim. They played with cars and had
+lots of fun. But then, something unexpected happened. A small squirrel came to
+play with them. The squirrel put on a show for Sue and Tim to say wnvhteon
+they came to see.
+Sue and Tim liked the squirrel. They thought it was perfect. The squirrel put
+on a funny hat and a tiny
 ```
