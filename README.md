@@ -25,27 +25,27 @@ make infer
 ```
 
 ## Sample outputs
-After one night of training on a laptop RTX 3080 (16 GB), prompted with `"Once upon a time, there was a"`:
+Prompted with `"Once upon a time, there was a"`:
 
 ```
-Once upon a time, there was a big, round ball standing in the park. The ball
-was very happy and started to roll all around. It was so much fun!
-The ball rolled faster and faster than ever before. It was a lot of fun, but
-it was also very tough. As the ball rolled, it started to get dizzy. The ball
-did not know why, but it got louder and louder.
-Suddenly, the ball rolled out of the bushes and it stopped rolling. The ball
-was sad and didn't know what to do. It didn't know how to roll around anymore
-because it was a ball. The ball was sor
-```
+markus@thinkpad:~/gpt$ make infer
+Loaded: d_model=512  hidden=1024  layers=16  vocab=256  seq_len=1024
+Generating 995 tokens (T=0.70, seed=1779612639)
+Once upon a time, there was a compassionate little girl named Lily. She loved to play with her friends in the park. One day, she saw a small bird on a tree. The bird was sad because its wing was hurt.
+Lily asked the bird, "Do you have any hurt wing?" The bird said, "Yes, I don't have any hurt wing." Lily wanted to help the bird, so she tried to make it feel better. But the bird was too big and her hurt wing still did not want to hurt Lily's wing.
+Lily had an idea. She found a long stick and brought it to the bird. The bird said, "Thank you, Lily! You saved me!" The bird felt better and thanked Lily. They played together in the park all day. They were very happy and became best friends.
+<|endoftext|>
+Once upon a time, there was a little girl named Mia. Mia loved to study with her toys. She had a big box full of toys in her room. One day, Mia found a new toy. The toy was a small doll. The doll had a pretty dress and smiled a little.
+Mia took the doll outside to play. She studied hard and felt the dress on her f
+markus@thinkpad:~/gpt$ make infer
+Loaded: d_model=512  hidden=1024  layers=16  vocab=256  seq_len=1024
+Generating 995 tokens (T=0.70, seed=1779612665)
+Once upon a time, there was a little boy named Tim. Tim had a big tree in his yard. He loved to run and play in the tree. One day, he saw a perfect bird in his yard. The bird was sad because it could not find its mom.
+Tim wanted to help the bird. He kneeled down and looked all around. He saw a little girl named Sue. Sue was playing with a ball. Tim asked her, "How can I be like your bird?" Sue smiled and said, "You can be my friend."
+Tim helped the bird get close to Sue. Sue was so happy and thanked Tim. They became good friends and played together in the tree. The bird sang a song and they all lived happily ever after.
+<|endoftext|>
 
-```
-Once upon a time, there was a little girl named Sue. She had a big room with
-many toys. Sue liked to play in her room every day. She thought it was fun to
-wear a pretty dress and shiny shoes.
-One day, Sue went to play with her friend Tim. They played with cars and had
-lots of fun. But then, something unexpected happened. A small squirrel came to
-play with them. The squirrel put on a show for Sue and Tim to say wnvhteon
-they came to see.
-Sue and Tim liked the squirrel. They thought it was perfect. The squirrel put
-on a funny hat and a tiny
+Once upon a time, there was a little boy. He was very careful as he walked around a park. One day, he saw an unusual thing called a rabbit. The rabbit hopped over to the thing and asked the other animals if they had seen it. The other animals thought it was a funny sight.
+The rabbit and the other animals were very curious. They asked the other animal, "What do you think is a fun
+markus@thinkpad:~/gpt$ 
 ```

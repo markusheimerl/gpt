@@ -37,7 +37,7 @@ cont: train.out data
 	@time ./train.out corpus.txt $$(ls -t *_gpt.bin 2>/dev/null | head -n1)
 
 infer: infer.out
-	@./infer.out $$(ls -t *_gpt.bin 2>/dev/null | head -n1) --prompt="Once upon a time, there was a" --temperature=0.7 --tokens=512
+	@./infer.out $$(ls -t *_gpt.bin 2>/dev/null | head -n1) --prompt="Once upon a time, there was a" --temperature=0.7 --tokens=1024
 
 clean:
 	rm -f *.out *.o *.csv
