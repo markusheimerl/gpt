@@ -442,6 +442,9 @@ jobs:
             exit 1
           fi
 
+          # Custom domain (must match Settings -> Pages -> Custom domain).
+          echo 'gpt.markusheimerl.com' > _site/CNAME
+
           echo "Site assembled:"
           ls -lh _site/
 
