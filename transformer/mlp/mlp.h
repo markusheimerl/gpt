@@ -9,6 +9,8 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
+#include "../muon.h"
+
 // CUDA Error checking macro
 #ifndef CHECK_CUDA
 #define CHECK_CUDA(call) do { \
@@ -39,17 +41,12 @@ typedef struct {
     half* d_W2;      // [hidden_dim x output_dim]
     half* d_W1_grad; // [input_dim x hidden_dim]
     half* d_W2_grad; // [hidden_dim x output_dim]
-    
-    // Adam parameters
-    float* d_W1_m;      // First moment for W1
-    float* d_W1_v;      // Second moment for W1
-    float* d_W2_m;      // First moment for W2
-    float* d_W2_v;      // Second moment for W2
-    float beta1;        // Exponential decay rate for first moment
-    float beta2;        // Exponential decay rate for second moment
-    float epsilon;      // Small constant for numerical stability
-    int t;              // Time step
-    float weight_decay; // Weight decay parameter for AdamW
+
+    // Muon optimizer state (one momentum buffer + scratch per weight matrix)
+    MuonState muon_W1;
+    MuonState muon_W2;
+    float beta;         // Momentum decay rate
+    float weight_decay; // Decoupled weight decay coefficient
     
     // Forward pass buffers
     half* d_preact;  // [batch_size x hidden_dim]

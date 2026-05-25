@@ -33,11 +33,8 @@ Attention* init_attention(int seq_len, int d_model, int num_heads, int batch_siz
     attn->is_causal = is_causal;
     attn->use_rope = use_rope;
     
-    // Initialize Adam parameters
-    attn->beta1 = 0.9f;
-    attn->beta2 = 0.999f;
-    attn->epsilon = 1e-8f;
-    attn->t = 0;
+    // Initialize Muon optimizer hyperparameters
+    attn->beta = 0.95f;
     attn->weight_decay = 0.01f;
     
     // Initialize cuBLASLt
@@ -73,16 +70,12 @@ Attention* init_attention(int seq_len, int d_model, int num_heads, int batch_siz
     CHECK_CUDA(cudaMalloc(&attn->d_W_k_grad, weight_size * sizeof(half)));
     CHECK_CUDA(cudaMalloc(&attn->d_W_v_grad, weight_size * sizeof(half)));
     CHECK_CUDA(cudaMalloc(&attn->d_W_o_grad, weight_size * sizeof(half)));
-    
-    // Allocate device memory for Adam parameters
-    CHECK_CUDA(cudaMalloc(&attn->d_W_q_m, weight_size * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&attn->d_W_q_v, weight_size * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&attn->d_W_k_m, weight_size * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&attn->d_W_k_v, weight_size * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&attn->d_W_v_m, weight_size * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&attn->d_W_v_v, weight_size * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&attn->d_W_o_m, weight_size * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&attn->d_W_o_v, weight_size * sizeof(float)));
+
+    // Initialize Muon optimizer state for each weight matrix
+    muon_state_init(&attn->muon_W_q, d_model, d_model);
+    muon_state_init(&attn->muon_W_k, d_model, d_model);
+    muon_state_init(&attn->muon_W_v, d_model, d_model);
+    muon_state_init(&attn->muon_W_o, d_model, d_model);
     
     // Allocate device memory for forward pass buffers
     CHECK_CUDA(cudaMalloc(&attn->d_Q, seq_batch_size * sizeof(half)));
@@ -110,17 +103,7 @@ Attention* init_attention(int seq_len, int d_model, int num_heads, int batch_siz
     CHECK_CUDA(cudaMemcpy(attn->d_W_k, h_W_k, weight_size * sizeof(half), cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(attn->d_W_v, h_W_v, weight_size * sizeof(half), cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(attn->d_W_o, h_W_o, weight_size * sizeof(half), cudaMemcpyHostToDevice));
-    
-    // Initialize Adam parameters to zero
-    CHECK_CUDA(cudaMemset(attn->d_W_q_m, 0, weight_size * sizeof(float)));
-    CHECK_CUDA(cudaMemset(attn->d_W_q_v, 0, weight_size * sizeof(float)));
-    CHECK_CUDA(cudaMemset(attn->d_W_k_m, 0, weight_size * sizeof(float)));
-    CHECK_CUDA(cudaMemset(attn->d_W_k_v, 0, weight_size * sizeof(float)));
-    CHECK_CUDA(cudaMemset(attn->d_W_v_m, 0, weight_size * sizeof(float)));
-    CHECK_CUDA(cudaMemset(attn->d_W_v_v, 0, weight_size * sizeof(float)));
-    CHECK_CUDA(cudaMemset(attn->d_W_o_m, 0, weight_size * sizeof(float)));
-    CHECK_CUDA(cudaMemset(attn->d_W_o_v, 0, weight_size * sizeof(float)));
-    
+
     // Create cuBLASLt matrix multiplication descriptor
     CHECK_CUBLASLT(cublasLtMatmulDescCreate(&attn->matmul_desc, CUBLAS_COMPUTE_32F_FAST_TF32, CUDA_R_32F));
     
@@ -170,8 +153,10 @@ void free_attention(Attention* attn) {
     // Free device memory
     cudaFree(attn->d_W_q); cudaFree(attn->d_W_k); cudaFree(attn->d_W_v); cudaFree(attn->d_W_o);
     cudaFree(attn->d_W_q_grad); cudaFree(attn->d_W_k_grad); cudaFree(attn->d_W_v_grad); cudaFree(attn->d_W_o_grad);
-    cudaFree(attn->d_W_q_m); cudaFree(attn->d_W_q_v); cudaFree(attn->d_W_k_m); cudaFree(attn->d_W_k_v);
-    cudaFree(attn->d_W_v_m); cudaFree(attn->d_W_v_v); cudaFree(attn->d_W_o_m); cudaFree(attn->d_W_o_v);
+    muon_state_free(&attn->muon_W_q);
+    muon_state_free(&attn->muon_W_k);
+    muon_state_free(&attn->muon_W_v);
+    muon_state_free(&attn->muon_W_o);
     cudaFree(attn->d_Q); cudaFree(attn->d_K); cudaFree(attn->d_V);
     cudaFree(attn->d_scores); cudaFree(attn->d_attn_weights);
     cudaFree(attn->d_attn_output); cudaFree(attn->d_output);
@@ -676,69 +661,24 @@ void backward_pass_attention(Attention* attn, half* d_X, half* d_grad_X) {
     }
 }
 
-// CUDA kernel for AdamW update
-__global__ static void adamw_update_kernel_attention(half* weight, half* grad, float* m, float* v,
-                                             float beta1, float beta2, float epsilon, float learning_rate,
-                                             float weight_decay, float alpha_t, int size, int batch_size) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < size) {
-        float g = __half2float(grad[idx]) / batch_size;
-        
-        // m = β₁m + (1-β₁)(∂L/∂W)
-        m[idx] = beta1 * m[idx] + (1.0f - beta1) * g;
-        // v = β₂v + (1-β₂)(∂L/∂W)²
-        v[idx] = beta2 * v[idx] + (1.0f - beta2) * g * g;
-        
-        float update = alpha_t * m[idx] / (sqrtf(v[idx]) + epsilon);
-        // W = (1-λη)W - η(m/(1-β₁ᵗ))/√(v/(1-β₂ᵗ) + ε)
-        float w = __half2float(weight[idx]);
-        weight[idx] = __float2half(w * (1.0f - learning_rate * weight_decay) - update);
-    }
-}
-
-// Update weights using AdamW
+// Update weights using Muon
 void update_weights_attention(Attention* attn, float learning_rate, int batch_size) {
-    attn->t++;
-    
-    float beta1_t = powf(attn->beta1, attn->t);
-    float beta2_t = powf(attn->beta2, attn->t);
-    float alpha_t = learning_rate * sqrtf(1.0f - beta2_t) / (1.0f - beta1_t);
-    
-    int weight_size = attn->d_model * attn->d_model;
-    int block_size = 256;
-    int num_blocks = (weight_size + block_size - 1) / block_size;
-    
-    // Update all weight matrices (W_q, W_k, W_v, W_o)
-    half* weights[] = {attn->d_W_q, attn->d_W_k, attn->d_W_v, attn->d_W_o};
-    half* grads[] = {attn->d_W_q_grad, attn->d_W_k_grad, attn->d_W_v_grad, attn->d_W_o_grad};
-    float* m_arrays[] = {attn->d_W_q_m, attn->d_W_k_m, attn->d_W_v_m, attn->d_W_o_m};
-    float* v_arrays[] = {attn->d_W_q_v, attn->d_W_k_v, attn->d_W_v_v, attn->d_W_o_v};
-    
+    half*       weights[] = {attn->d_W_q,        attn->d_W_k,        attn->d_W_v,        attn->d_W_o};
+    half*       grads[]   = {attn->d_W_q_grad,   attn->d_W_k_grad,   attn->d_W_v_grad,   attn->d_W_o_grad};
+    MuonState*  states[]  = {&attn->muon_W_q,    &attn->muon_W_k,    &attn->muon_W_v,    &attn->muon_W_o};
     for (int w = 0; w < 4; w++) {
-        adamw_update_kernel_attention<<<num_blocks, block_size>>>(
-            weights[w], grads[w], m_arrays[w], v_arrays[w],
-            attn->beta1, attn->beta2, attn->epsilon, learning_rate, attn->weight_decay,
-            alpha_t, weight_size, batch_size
-        );
+        muon_step(attn->cublaslt_handle, attn->matmul_desc,
+                  weights[w], grads[w], states[w],
+                  attn->beta, learning_rate, attn->weight_decay, batch_size);
     }
 }
 
 // Reset optimizer state
 void reset_optimizer_attention(Attention* attn) {
-    int weight_size = attn->d_model * attn->d_model;
-    
-    // Reset Adam moment estimates to zero on device
-    CHECK_CUDA(cudaMemset(attn->d_W_q_m, 0, weight_size * sizeof(float)));
-    CHECK_CUDA(cudaMemset(attn->d_W_q_v, 0, weight_size * sizeof(float)));
-    CHECK_CUDA(cudaMemset(attn->d_W_k_m, 0, weight_size * sizeof(float)));
-    CHECK_CUDA(cudaMemset(attn->d_W_k_v, 0, weight_size * sizeof(float)));
-    CHECK_CUDA(cudaMemset(attn->d_W_v_m, 0, weight_size * sizeof(float)));
-    CHECK_CUDA(cudaMemset(attn->d_W_v_v, 0, weight_size * sizeof(float)));
-    CHECK_CUDA(cudaMemset(attn->d_W_o_m, 0, weight_size * sizeof(float)));
-    CHECK_CUDA(cudaMemset(attn->d_W_o_v, 0, weight_size * sizeof(float)));
-    
-    // Reset time step
-    attn->t = 0;
+    muon_state_reset(&attn->muon_W_q);
+    muon_state_reset(&attn->muon_W_k);
+    muon_state_reset(&attn->muon_W_v);
+    muon_state_reset(&attn->muon_W_o);
 }
 
 // Serialize attention to file
@@ -777,43 +717,12 @@ void serialize_attention(Attention* attn, FILE* file) {
     fwrite(h_W_o, sizeof(float), weight_size, file);
     
     free(h_W_q); free(h_W_k); free(h_W_v); free(h_W_o);
-    
-    // Write optimizer state
-    fwrite(&attn->t, sizeof(int), 1, file);
-    
-    // Allocate host buffers for optimizer state
-    float* h_W_q_m = (float*)malloc(weight_size * sizeof(float));
-    float* h_W_q_v = (float*)malloc(weight_size * sizeof(float));
-    float* h_W_k_m = (float*)malloc(weight_size * sizeof(float));
-    float* h_W_k_v = (float*)malloc(weight_size * sizeof(float));
-    float* h_W_v_m = (float*)malloc(weight_size * sizeof(float));
-    float* h_W_v_v = (float*)malloc(weight_size * sizeof(float));
-    float* h_W_o_m = (float*)malloc(weight_size * sizeof(float));
-    float* h_W_o_v = (float*)malloc(weight_size * sizeof(float));
-    
-    // Copy optimizer state from device
-    CHECK_CUDA(cudaMemcpy(h_W_q_m, attn->d_W_q_m, weight_size * sizeof(float), cudaMemcpyDeviceToHost));
-    CHECK_CUDA(cudaMemcpy(h_W_q_v, attn->d_W_q_v, weight_size * sizeof(float), cudaMemcpyDeviceToHost));
-    CHECK_CUDA(cudaMemcpy(h_W_k_m, attn->d_W_k_m, weight_size * sizeof(float), cudaMemcpyDeviceToHost));
-    CHECK_CUDA(cudaMemcpy(h_W_k_v, attn->d_W_k_v, weight_size * sizeof(float), cudaMemcpyDeviceToHost));
-    CHECK_CUDA(cudaMemcpy(h_W_v_m, attn->d_W_v_m, weight_size * sizeof(float), cudaMemcpyDeviceToHost));
-    CHECK_CUDA(cudaMemcpy(h_W_v_v, attn->d_W_v_v, weight_size * sizeof(float), cudaMemcpyDeviceToHost));
-    CHECK_CUDA(cudaMemcpy(h_W_o_m, attn->d_W_o_m, weight_size * sizeof(float), cudaMemcpyDeviceToHost));
-    CHECK_CUDA(cudaMemcpy(h_W_o_v, attn->d_W_o_v, weight_size * sizeof(float), cudaMemcpyDeviceToHost));
-    
-    // Write optimizer state
-    fwrite(h_W_q_m, sizeof(float), weight_size, file);
-    fwrite(h_W_q_v, sizeof(float), weight_size, file);
-    fwrite(h_W_k_m, sizeof(float), weight_size, file);
-    fwrite(h_W_k_v, sizeof(float), weight_size, file);
-    fwrite(h_W_v_m, sizeof(float), weight_size, file);
-    fwrite(h_W_v_v, sizeof(float), weight_size, file);
-    fwrite(h_W_o_m, sizeof(float), weight_size, file);
-    fwrite(h_W_o_v, sizeof(float), weight_size, file);
-    
-    // Free host buffers
-    free(h_W_q_m); free(h_W_q_v); free(h_W_k_m); free(h_W_k_v);
-    free(h_W_v_m); free(h_W_v_v); free(h_W_o_m); free(h_W_o_v);
+
+    // Write Muon momentum buffers
+    muon_state_serialize(&attn->muon_W_q, file);
+    muon_state_serialize(&attn->muon_W_k, file);
+    muon_state_serialize(&attn->muon_W_v, file);
+    muon_state_serialize(&attn->muon_W_o, file);
 }
 
 // Deserialize attention from file
@@ -857,43 +766,12 @@ Attention* deserialize_attention(FILE* file, int batch_size, int seq_len, int nu
     CHECK_CUDA(cudaMemcpy(attn->d_W_o, h_W_o, weight_size * sizeof(half), cudaMemcpyHostToDevice));
     
     free(h_W_q); free(h_W_k); free(h_W_v); free(h_W_o);
-    
-    // Read optimizer state
-    fread(&attn->t, sizeof(int), 1, file);
-    
-    // Allocate host buffers for optimizer state
-    float* h_W_q_m = (float*)malloc(weight_size * sizeof(float));
-    float* h_W_q_v = (float*)malloc(weight_size * sizeof(float));
-    float* h_W_k_m = (float*)malloc(weight_size * sizeof(float));
-    float* h_W_k_v = (float*)malloc(weight_size * sizeof(float));
-    float* h_W_v_m = (float*)malloc(weight_size * sizeof(float));
-    float* h_W_v_v = (float*)malloc(weight_size * sizeof(float));
-    float* h_W_o_m = (float*)malloc(weight_size * sizeof(float));
-    float* h_W_o_v = (float*)malloc(weight_size * sizeof(float));
-    
-    // Read optimizer state
-    fread(h_W_q_m, sizeof(float), weight_size, file);
-    fread(h_W_q_v, sizeof(float), weight_size, file);
-    fread(h_W_k_m, sizeof(float), weight_size, file);
-    fread(h_W_k_v, sizeof(float), weight_size, file);
-    fread(h_W_v_m, sizeof(float), weight_size, file);
-    fread(h_W_v_v, sizeof(float), weight_size, file);
-    fread(h_W_o_m, sizeof(float), weight_size, file);
-    fread(h_W_o_v, sizeof(float), weight_size, file);
-    
-    // Copy optimizer state to device
-    CHECK_CUDA(cudaMemcpy(attn->d_W_q_m, h_W_q_m, weight_size * sizeof(float), cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(attn->d_W_q_v, h_W_q_v, weight_size * sizeof(float), cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(attn->d_W_k_m, h_W_k_m, weight_size * sizeof(float), cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(attn->d_W_k_v, h_W_k_v, weight_size * sizeof(float), cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(attn->d_W_v_m, h_W_v_m, weight_size * sizeof(float), cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(attn->d_W_v_v, h_W_v_v, weight_size * sizeof(float), cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(attn->d_W_o_m, h_W_o_m, weight_size * sizeof(float), cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(attn->d_W_o_v, h_W_o_v, weight_size * sizeof(float), cudaMemcpyHostToDevice));
-    
-    // Free host buffers
-    free(h_W_q_m); free(h_W_q_v); free(h_W_k_m); free(h_W_k_v);
-    free(h_W_v_m); free(h_W_v_v); free(h_W_o_m); free(h_W_o_v);
-    
+
+    // Read Muon momentum buffers
+    muon_state_deserialize(&attn->muon_W_q, file);
+    muon_state_deserialize(&attn->muon_W_k, file);
+    muon_state_deserialize(&attn->muon_W_v, file);
+    muon_state_deserialize(&attn->muon_W_o, file);
+
     return attn;
 }

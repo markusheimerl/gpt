@@ -26,12 +26,10 @@ GPT* init_gpt(int seq_len, int d_model, int hidden_dim, int num_layers, int batc
     gpt->vocab_size = 256;
     gpt->cublaslt_handle = cublaslt_handle;
     
-    // Initialize Adam parameters
-    gpt->beta1 = 0.9f;
-    gpt->beta2 = 0.999f;
-    gpt->epsilon = 1e-8f;
-    gpt->t = 0;
+    // Initialize Muon optimizer hyperparameters
+    gpt->beta = 0.95f;
     gpt->weight_decay = 0.01f;
+    gpt->t = 0;
     
     size_t token_emb_size = gpt->vocab_size * d_model;
     size_t embedded_size = batch_size * seq_len * d_model;
@@ -50,10 +48,9 @@ GPT* init_gpt(int seq_len, int d_model, int hidden_dim, int num_layers, int batc
     // Allocate device memory for embeddings and gradients
     CHECK_CUDA(cudaMalloc(&gpt->d_token_embedding, token_emb_size * sizeof(half)));
     CHECK_CUDA(cudaMalloc(&gpt->d_token_embedding_grad, token_emb_size * sizeof(half)));
-    
-    // Allocate device memory for Adam parameters
-    CHECK_CUDA(cudaMalloc(&gpt->d_token_embedding_m, token_emb_size * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&gpt->d_token_embedding_v, token_emb_size * sizeof(float)));
+
+    // Initialize Muon optimizer state for token embedding
+    muon_state_init(&gpt->muon_token_embedding, gpt->vocab_size, d_model);
     
     // Allocate device memory for forward pass buffers
     CHECK_CUDA(cudaMalloc(&gpt->d_embedded_input, embedded_size * sizeof(half)));
@@ -69,11 +66,7 @@ GPT* init_gpt(int seq_len, int d_model, int hidden_dim, int num_layers, int batc
     
     // Copy embeddings to device
     CHECK_CUDA(cudaMemcpy(gpt->d_token_embedding, h_token_embedding, token_emb_size * sizeof(half), cudaMemcpyHostToDevice));
-    
-    // Initialize Adam parameters to zero
-    CHECK_CUDA(cudaMemset(gpt->d_token_embedding_m, 0, token_emb_size * sizeof(float)));
-    CHECK_CUDA(cudaMemset(gpt->d_token_embedding_v, 0, token_emb_size * sizeof(float)));
-    
+
     // Initialize transformer
     gpt->transformer = init_transformer(seq_len, d_model, hidden_dim, num_layers, batch_size, true, true, cublaslt_handle);
     
@@ -117,7 +110,7 @@ void free_gpt(GPT* gpt) {
     
     // Free device memory
     cudaFree(gpt->d_token_embedding); cudaFree(gpt->d_token_embedding_grad);
-    cudaFree(gpt->d_token_embedding_m); cudaFree(gpt->d_token_embedding_v);
+    muon_state_free(&gpt->muon_token_embedding);
     cudaFree(gpt->d_embedded_input);
     cudaFree(gpt->d_norm_output);
     cudaFree(gpt->d_output);
@@ -333,60 +326,24 @@ void backward_pass_gpt(GPT* gpt, unsigned char* d_input_tokens) {
     );
 }
 
-// CUDA kernel for AdamW update
-__global__ static void adamw_update_kernel_gpt(half* weight, half* grad, float* m, float* v,
-                                               float beta1, float beta2, float epsilon, float learning_rate,
-                                               float weight_decay, float alpha_t, int size, int batch_size) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < size) {
-        float g = __half2float(grad[idx]) / batch_size;
-        
-        // m = β₁m + (1-β₁)(∂L/∂W)
-        m[idx] = beta1 * m[idx] + (1.0f - beta1) * g;
-        // v = β₂v + (1-β₂)(∂L/∂W)²
-        v[idx] = beta2 * v[idx] + (1.0f - beta2) * g * g;
-        
-        float update = alpha_t * m[idx] / (sqrtf(v[idx]) + epsilon);
-        // W = (1-λη)W - η(m/(1-β₁ᵗ))/√(v/(1-β₂ᵗ) + ε)
-        float w = __half2float(weight[idx]);
-        weight[idx] = __float2half(w * (1.0f - learning_rate * weight_decay) - update);
-    }
-}
-
 // Update weights
 void update_weights_gpt(GPT* gpt, float learning_rate, int batch_size) {
     gpt->t++;
-    
-    float beta1_t = powf(gpt->beta1, gpt->t);
-    float beta2_t = powf(gpt->beta2, gpt->t);
-    float alpha_t = learning_rate * sqrtf(1.0f - beta2_t) / (1.0f - beta1_t);
-    
-    int block_size = 256;
-    
-    // Update token embeddings
-    int token_emb_size = gpt->vocab_size * gpt->d_model;
-    int token_blocks = (token_emb_size + block_size - 1) / block_size;
-    adamw_update_kernel_gpt<<<token_blocks, block_size>>>(
-        gpt->d_token_embedding, gpt->d_token_embedding_grad, gpt->d_token_embedding_m, gpt->d_token_embedding_v,
-        gpt->beta1, gpt->beta2, gpt->epsilon, learning_rate, gpt->weight_decay,
-        alpha_t, token_emb_size, batch_size
-    );
-    
+    // Token embedding: Muon update
+    muon_step(gpt->cublaslt_handle, gpt->matmul_desc,
+              gpt->d_token_embedding, gpt->d_token_embedding_grad,
+              &gpt->muon_token_embedding,
+              gpt->beta, learning_rate, gpt->weight_decay, batch_size);
+
     // Update transformer weights
     update_weights_transformer(gpt->transformer, learning_rate, batch_size);
 }
 
 // Reset optimizer state
 void reset_optimizer_gpt(GPT* gpt) {
-    int token_emb_size = gpt->vocab_size * gpt->d_model;
-    
-    // Reset Adam moment estimates to zero on device
-    CHECK_CUDA(cudaMemset(gpt->d_token_embedding_m, 0, token_emb_size * sizeof(float)));
-    CHECK_CUDA(cudaMemset(gpt->d_token_embedding_v, 0, token_emb_size * sizeof(float)));
-    
-    // Reset time step
+    muon_state_reset(&gpt->muon_token_embedding);
     gpt->t = 0;
-    
+
     // Reset transformer optimizer state
     reset_optimizer_transformer(gpt->transformer);
 }
@@ -414,21 +371,11 @@ static void serialize_gpt(GPT* gpt, FILE* file) {
     fwrite(h_token_embedding, sizeof(float), token_emb_size, file);
     
     free(h_token_embedding);
-    
-    // Write optimizer state
+
+    // Write Muon momentum buffer for token embedding
     fwrite(&gpt->t, sizeof(int), 1, file);
-    
-    float* h_token_embedding_m = (float*)malloc(token_emb_size * sizeof(float));
-    float* h_token_embedding_v = (float*)malloc(token_emb_size * sizeof(float));
-    
-    CHECK_CUDA(cudaMemcpy(h_token_embedding_m, gpt->d_token_embedding_m, token_emb_size * sizeof(float), cudaMemcpyDeviceToHost));
-    CHECK_CUDA(cudaMemcpy(h_token_embedding_v, gpt->d_token_embedding_v, token_emb_size * sizeof(float), cudaMemcpyDeviceToHost));
-    
-    fwrite(h_token_embedding_m, sizeof(float), token_emb_size, file);
-    fwrite(h_token_embedding_v, sizeof(float), token_emb_size, file);
-    
-    free(h_token_embedding_m); free(h_token_embedding_v);
-    
+    muon_state_serialize(&gpt->muon_token_embedding, file);
+
     // Serialize transformer
     serialize_transformer(gpt->transformer, file);
 }
@@ -460,21 +407,11 @@ static GPT* deserialize_gpt(FILE* file, int batch_size, int seq_len, cublasLtHan
     CHECK_CUDA(cudaMemcpy(gpt->d_token_embedding, h_token_embedding, token_emb_size * sizeof(half), cudaMemcpyHostToDevice));
     
     free(h_token_embedding);
-    
-    // Read optimizer state
+
+    // Read Muon momentum buffer for token embedding
     fread(&gpt->t, sizeof(int), 1, file);
-    
-    float* h_token_embedding_m = (float*)malloc(token_emb_size * sizeof(float));
-    float* h_token_embedding_v = (float*)malloc(token_emb_size * sizeof(float));
-    
-    fread(h_token_embedding_m, sizeof(float), token_emb_size, file);
-    fread(h_token_embedding_v, sizeof(float), token_emb_size, file);
-    
-    CHECK_CUDA(cudaMemcpy(gpt->d_token_embedding_m, h_token_embedding_m, token_emb_size * sizeof(float), cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(gpt->d_token_embedding_v, h_token_embedding_v, token_emb_size * sizeof(float), cudaMemcpyHostToDevice));
-    
-    free(h_token_embedding_m); free(h_token_embedding_v);
-    
+    muon_state_deserialize(&gpt->muon_token_embedding, file);
+
     // Free the initialized transformer
     free_transformer(gpt->transformer);
     

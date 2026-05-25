@@ -9,7 +9,7 @@ The core of the model is a multi-layer transformer that processes the embedded s
 
 After processing through all transformer layers, a linear projection maps the final hidden states to logits over the vocabulary (all 256 possible byte values). These logits are converted to probabilities using the softmax function, and the model is trained to maximize the probability of the correct next byte using cross-entropy loss.
 
-The training process uses the AdamW optimizer, which enhances the standard Adam optimizer by decoupling weight decay from the gradient-based update. AdamW maintains exponential moving averages of both gradients and squared gradients, using these to adapt the learning rate for each parameter individually. The weight decay acts as L2 regularization, encouraging the model to use smaller weights and improving generalization.
+The training process uses the Muon optimizer, which enhances the standard Adam optimizer by decoupling weight decay from the gradient-based update. Muon maintains exponential moving averages of both gradients and squared gradients, using these to adapt the learning rate for each parameter individually. The weight decay acts as L2 regularization, encouraging the model to use smaller weights and improving generalization.
 
 The implementation uses BLAS (Basic Linear Algebra Subprograms) for efficient matrix operations, allowing the model to train effectively on modern hardware.
 

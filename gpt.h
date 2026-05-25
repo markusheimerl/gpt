@@ -10,6 +10,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include "transformer/transformer.h"
+#include "transformer/muon.h"
 
 // CUDA Error checking macro
 #ifndef CHECK_CUDA
@@ -39,15 +40,12 @@ typedef struct {
     // Token embedding layer
     half* d_token_embedding;       // [vocab_size x d_model]
     half* d_token_embedding_grad;  // [vocab_size x d_model]
-    
-    // Adam parameters for embeddings
-    float* d_token_embedding_m;    // First moment for token embeddings
-    float* d_token_embedding_v;    // Second moment for token embeddings
-    float beta1;                   // Exponential decay rate for first moment
-    float beta2;                   // Exponential decay rate for second moment
-    float epsilon;                 // Small constant for numerical stability
-    int t;                         // Time step
-    float weight_decay;            // Weight decay parameter for AdamW
+
+    // Muon optimizer state for the token embedding matrix
+    MuonState muon_token_embedding;
+    float beta;                    // Momentum decay rate
+    float weight_decay;            // Decoupled weight decay coefficient
+    int t;                         // Training step counter (for checkpoint resume)
     
     // Forward pass buffers
     half* d_embedded_input;        // [batch_size x seq_len x d_model]

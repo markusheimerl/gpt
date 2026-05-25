@@ -110,7 +110,7 @@ int main() {
     
     // Training parameters
     const int num_epochs = 10;
-    const float learning_rate = 0.0003f;
+    const float learning_rate = 0.001f;
     const int num_batches = num_samples / batch_size;
     
     // Allocate device memory for batch data
