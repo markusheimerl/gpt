@@ -10,11 +10,12 @@
     CHECK_CUBLASLT(cublasLtMatmul(gpt->cublaslt_handle, gpt->matmul_desc, \
                                   alpha, A, layA, B, layB, \
                                   beta, C, layC, \
-                                  C, layC, NULL, NULL, 0, 0)); \
+                                  C, layC, NULL, \
+                                  gpt->d_workspace, gpt->workspace_size, 0)); \
 } while(0)
 
 // Initialize the GPT
-GPT* init_gpt(int seq_len, int d_model, int hidden_dim, int num_layers, int batch_size, cublasLtHandle_t cublaslt_handle) {
+GPT* init_gpt(int seq_len, int d_model, int hidden_dim, int num_layers, int batch_size, cublasLtHandle_t cublaslt_handle, void* d_workspace, size_t workspace_size) {
     GPT* gpt = (GPT*)malloc(sizeof(GPT));
     
     // Store dimensions
@@ -25,6 +26,8 @@ GPT* init_gpt(int seq_len, int d_model, int hidden_dim, int num_layers, int batc
     gpt->num_layers = num_layers;
     gpt->vocab_size = 256;
     gpt->cublaslt_handle = cublaslt_handle;
+    gpt->d_workspace = d_workspace;
+    gpt->workspace_size = workspace_size;
     
     // Initialize Adam parameters
     gpt->beta1 = 0.9f;
@@ -75,7 +78,7 @@ GPT* init_gpt(int seq_len, int d_model, int hidden_dim, int num_layers, int batc
     CHECK_CUDA(cudaMemset(gpt->d_token_embedding_v, 0, token_emb_size * sizeof(float)));
     
     // Initialize transformer
-    gpt->transformer = init_transformer(seq_len, d_model, hidden_dim, num_layers, batch_size, true, true, cublaslt_handle);
+    gpt->transformer = init_transformer(seq_len, d_model, hidden_dim, num_layers, batch_size, true, true, cublaslt_handle, d_workspace, workspace_size);
     
     // Create cuBLASLt matrix multiplication descriptor
     CHECK_CUBLASLT(cublasLtMatmulDescCreate(&gpt->matmul_desc, CUBLAS_COMPUTE_32F_FAST_TF32, CUDA_R_32F));
@@ -434,7 +437,7 @@ static void serialize_gpt(GPT* gpt, FILE* file) {
 }
 
 // Deserialize GPT from a file
-static GPT* deserialize_gpt(FILE* file, int batch_size, int seq_len, cublasLtHandle_t cublaslt_handle) {
+static GPT* deserialize_gpt(FILE* file, int batch_size, int seq_len, cublasLtHandle_t cublaslt_handle, void* d_workspace, size_t workspace_size) {
     // Read dimensions
     int d_model, hidden_dim, num_layers, vocab_size;
     fread(&d_model, sizeof(int), 1, file);
@@ -443,7 +446,7 @@ static GPT* deserialize_gpt(FILE* file, int batch_size, int seq_len, cublasLtHan
     fread(&vocab_size, sizeof(int), 1, file);
     
     // Initialize GPT
-    GPT* gpt = init_gpt(seq_len, d_model, hidden_dim, num_layers, batch_size, cublaslt_handle);
+    GPT* gpt = init_gpt(seq_len, d_model, hidden_dim, num_layers, batch_size, cublaslt_handle, d_workspace, workspace_size);
     
     int token_emb_size = vocab_size * d_model;
     
@@ -479,7 +482,7 @@ static GPT* deserialize_gpt(FILE* file, int batch_size, int seq_len, cublasLtHan
     free_transformer(gpt->transformer);
     
     // Deserialize transformer
-    gpt->transformer = deserialize_transformer(file, batch_size, seq_len, cublaslt_handle);
+    gpt->transformer = deserialize_transformer(file, batch_size, seq_len, cublaslt_handle, d_workspace, workspace_size);
     
     return gpt;
 }
@@ -499,14 +502,14 @@ void save_gpt(GPT* gpt, const char* filename) {
 }
 
 // Load GPT from a file
-GPT* load_gpt(const char* filename, int batch_size, int seq_len, cublasLtHandle_t cublaslt_handle) {
+GPT* load_gpt(const char* filename, int batch_size, int seq_len, cublasLtHandle_t cublaslt_handle, void* d_workspace, size_t workspace_size) {
     FILE* file = fopen(filename, "rb");
     if (!file) {
         printf("Error opening file for reading: %s\n", filename);
         return NULL;
     }
     
-    GPT* gpt = deserialize_gpt(file, batch_size, seq_len, cublaslt_handle);
+    GPT* gpt = deserialize_gpt(file, batch_size, seq_len, cublaslt_handle, d_workspace, workspace_size);
     
     fclose(file);
     printf("Model loaded from %s\n", filename);

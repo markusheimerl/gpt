@@ -145,6 +145,9 @@ int main() {
     // Initialize cuBLASLt
     cublasLtHandle_t cublaslt_handle;
     CHECK_CUBLASLT(cublasLtCreate(&cublaslt_handle));
+    void* d_workspace;
+    size_t workspace_size = 32 * 1024 * 1024;
+    CHECK_CUDA(cudaMalloc(&d_workspace, workspace_size));
 
     // Parameters
     const int seq_len = 128;
@@ -165,7 +168,7 @@ int main() {
     for (int i = 0; i < num_samples * seq_len * d_model; i++) h_y[i] = __float2half(y[i]);
     
     // Initialize transformer
-    Transformer* transformer = init_transformer(seq_len, d_model, hidden_dim, num_layers, batch_size, false, false, cublaslt_handle);
+    Transformer* transformer = init_transformer(seq_len, d_model, hidden_dim, num_layers, batch_size, false, false, cublaslt_handle, d_workspace, workspace_size);
     
     // Training parameters
     const int num_epochs = 50;
@@ -234,7 +237,7 @@ int main() {
     printf("\nVerifying saved model...\n");
 
     model_file = fopen(model_fname, "rb");
-    Transformer* loaded_transformer = deserialize_transformer(model_file, batch_size, seq_len, cublaslt_handle);
+    Transformer* loaded_transformer = deserialize_transformer(model_file, batch_size, seq_len, cublaslt_handle, d_workspace, workspace_size);
     fclose(model_file);
     printf("Model loaded from %s\n", model_fname);
 
@@ -303,6 +306,7 @@ int main() {
     CHECK_CUDA(cudaFree(d_y));
     free_transformer(transformer);
     free_transformer(loaded_transformer);
+    CHECK_CUDA(cudaFree(d_workspace));
     CHECK_CUBLASLT(cublasLtDestroy(cublaslt_handle));
     
     return 0;

@@ -79,9 +79,11 @@ typedef struct {
     // Loss computation buffer
     float* d_loss_result;      // [1]
 
-    // cuBLASLt handle and descriptor
+    // cuBLASLt handle and descriptor (workspace is borrowed, not owned)
     cublasLtHandle_t cublaslt_handle;
     cublasLtMatmulDesc_t matmul_desc;
+    void* d_workspace;
+    size_t workspace_size;
     
     // Matrix layouts
     cublasLtMatrixLayout_t weight_layout;     // [d_model x d_model]
@@ -101,7 +103,7 @@ typedef struct {
 } Attention;
 
 // Function prototypes
-Attention* init_attention(int seq_len, int d_model, int num_heads, int batch_size, bool is_causal, bool use_rope, cublasLtHandle_t cublaslt_handle);
+Attention* init_attention(int seq_len, int d_model, int num_heads, int batch_size, bool is_causal, bool use_rope, cublasLtHandle_t cublaslt_handle, void* d_workspace, size_t workspace_size);
 void free_attention(Attention* attn);
 void forward_pass_attention(Attention* attn, half* d_X);
 float calculate_loss_attention(Attention* attn, half* d_y);
@@ -110,6 +112,6 @@ void backward_pass_attention(Attention* attn, half* d_X, half* d_grad_X);
 void update_weights_attention(Attention* attn, float learning_rate, int batch_size);
 void reset_optimizer_attention(Attention* attn);
 void serialize_attention(Attention* attn, FILE* file);
-Attention* deserialize_attention(FILE* file, int batch_size, int seq_len, int num_heads, cublasLtHandle_t cublaslt_handle);
+Attention* deserialize_attention(FILE* file, int batch_size, int seq_len, int num_heads, cublasLtHandle_t cublaslt_handle, void* d_workspace, size_t workspace_size);
 
 #endif

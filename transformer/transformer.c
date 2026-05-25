@@ -1,7 +1,7 @@
 #include "transformer.h"
 
 // Initialize the transformer
-Transformer* init_transformer(int seq_len, int d_model, int hidden_dim, int num_layers, int batch_size, bool is_causal, bool use_rope, cublasLtHandle_t cublaslt_handle) {
+Transformer* init_transformer(int seq_len, int d_model, int hidden_dim, int num_layers, int batch_size, bool is_causal, bool use_rope, cublasLtHandle_t cublaslt_handle, void* d_workspace, size_t workspace_size) {
     Transformer* transformer = (Transformer*)malloc(sizeof(Transformer));
     
     // Store dimensions and handle
@@ -11,6 +11,8 @@ Transformer* init_transformer(int seq_len, int d_model, int hidden_dim, int num_
     transformer->hidden_dim = hidden_dim;
     transformer->num_layers = num_layers;
     transformer->cublaslt_handle = cublaslt_handle;
+    transformer->d_workspace = d_workspace;
+    transformer->workspace_size = workspace_size;
     
     // Allocate RMSNorm buffer arrays
     size_t norm_buffer_size = batch_size * seq_len * d_model * sizeof(half);
@@ -28,8 +30,8 @@ Transformer* init_transformer(int seq_len, int d_model, int hidden_dim, int num_
     
     // Initialize all layers
     for (int i = 0; i < num_layers; i++) {
-        transformer->attention_layers[i] = init_attention(seq_len, d_model, 8, batch_size, is_causal, use_rope, cublaslt_handle);
-        transformer->mlp_layers[i] = init_mlp(d_model, hidden_dim, d_model, batch_size * seq_len, cublaslt_handle);
+        transformer->attention_layers[i] = init_attention(seq_len, d_model, 8, batch_size, is_causal, use_rope, cublaslt_handle, d_workspace, workspace_size);
+        transformer->mlp_layers[i] = init_mlp(d_model, hidden_dim, d_model, batch_size * seq_len, cublaslt_handle, d_workspace, workspace_size);
     }
     
     return transformer;
@@ -324,7 +326,7 @@ void serialize_transformer(Transformer* transformer, FILE* file) {
 }
 
 // Deserialize transformer from a file
-Transformer* deserialize_transformer(FILE* file, int batch_size, int seq_len, cublasLtHandle_t cublaslt_handle) {
+Transformer* deserialize_transformer(FILE* file, int batch_size, int seq_len, cublasLtHandle_t cublaslt_handle, void* d_workspace, size_t workspace_size) {
     // Read dimensions
     int d_model, hidden_dim, num_layers;
     bool is_causal, use_rope;
@@ -335,7 +337,7 @@ Transformer* deserialize_transformer(FILE* file, int batch_size, int seq_len, cu
     fread(&use_rope, sizeof(bool), 1, file);
     
     // Initialize transformer
-    Transformer* transformer = init_transformer(seq_len, d_model, hidden_dim, num_layers, batch_size, is_causal, use_rope, cublaslt_handle);
+    Transformer* transformer = init_transformer(seq_len, d_model, hidden_dim, num_layers, batch_size, is_causal, use_rope, cublaslt_handle, d_workspace, workspace_size);
     
     // Deserialize all layers
     for (int i = 0; i < num_layers; i++) {
@@ -344,8 +346,8 @@ Transformer* deserialize_transformer(FILE* file, int batch_size, int seq_len, cu
         free_mlp(transformer->mlp_layers[i]);
         
         // Deserialize the saved components
-        transformer->attention_layers[i] = deserialize_attention(file, batch_size, seq_len, 8, cublaslt_handle);
-        transformer->mlp_layers[i] = deserialize_mlp(file, batch_size * seq_len, cublaslt_handle);
+        transformer->attention_layers[i] = deserialize_attention(file, batch_size, seq_len, 8, cublaslt_handle, d_workspace, workspace_size);
+        transformer->mlp_layers[i] = deserialize_mlp(file, batch_size * seq_len, cublaslt_handle, d_workspace, workspace_size);
     }
     
     return transformer;

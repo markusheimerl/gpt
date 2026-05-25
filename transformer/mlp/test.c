@@ -87,6 +87,9 @@ int main() {
     // Initialize cuBLASLt
     cublasLtHandle_t cublaslt_handle;
     CHECK_CUBLASLT(cublasLtCreate(&cublaslt_handle));
+    void* d_workspace;
+    size_t workspace_size = 32 * 1024 * 1024;
+    CHECK_CUDA(cudaMalloc(&d_workspace, workspace_size));
 
     // Parameters
     const int input_dim = 16;
@@ -106,7 +109,7 @@ int main() {
     for (int i = 0; i < num_samples * output_dim; i++) h_y[i] = __float2half(y[i]);
 
     // Initialize network
-    MLP* mlp = init_mlp(input_dim, hidden_dim, output_dim, batch_size, cublaslt_handle);
+    MLP* mlp = init_mlp(input_dim, hidden_dim, output_dim, batch_size, cublaslt_handle, d_workspace, workspace_size);
     
     // Training parameters
     const int num_epochs = 10;
@@ -173,7 +176,7 @@ int main() {
     printf("\nVerifying saved model...\n");
 
     model_file = fopen(model_fname, "rb");
-    MLP* loaded_mlp = deserialize_mlp(model_file, batch_size, cublaslt_handle);
+    MLP* loaded_mlp = deserialize_mlp(model_file, batch_size, cublaslt_handle, d_workspace, workspace_size);
     fclose(model_file);
     printf("Model loaded from %s\n", model_fname);
     
@@ -232,6 +235,7 @@ int main() {
     CHECK_CUDA(cudaFree(d_y));
     free_mlp(mlp);
     free_mlp(loaded_mlp);
+    CHECK_CUDA(cudaFree(d_workspace));
     CHECK_CUBLASLT(cublasLtDestroy(cublaslt_handle));
     
     return 0;

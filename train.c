@@ -155,6 +155,9 @@ int main(int argc, char* argv[]) {
     // Initialize cuBLAS
     cublasLtHandle_t cublaslt_handle;
     CHECK_CUBLASLT(cublasLtCreate(&cublaslt_handle));
+    void* d_workspace;
+    size_t workspace_size = 32 * 1024 * 1024;
+    CHECK_CUDA(cudaMalloc(&d_workspace, workspace_size));
 
     // Model hyperparameters
     const int seq_len = 1024;
@@ -167,9 +170,9 @@ int main(int argc, char* argv[]) {
     
     // Initialize or load model
     if (checkpoint_path) {
-        gpt = load_gpt(checkpoint_path, batch_size, seq_len, cublaslt_handle);
+        gpt = load_gpt(checkpoint_path, batch_size, seq_len, cublaslt_handle, d_workspace, workspace_size);
     } else {
-        gpt = init_gpt(seq_len, d_model, hidden_dim, num_layers, batch_size, cublaslt_handle);
+        gpt = init_gpt(seq_len, d_model, hidden_dim, num_layers, batch_size, cublaslt_handle, d_workspace, workspace_size);
     }
     
     printf("Parameters: ~%.1fM\n", (float)(gpt->vocab_size * gpt->d_model + gpt->transformer->num_layers * ((size_t)4 * gpt->d_model * gpt->d_model + gpt->d_model * gpt->transformer->mlp_layers[0]->hidden_dim + gpt->transformer->mlp_layers[0]->hidden_dim * gpt->d_model)) / 1e6f);
@@ -279,6 +282,7 @@ int main(int argc, char* argv[]) {
     CHECK_CUDA(cudaFree(d_target_tokens));
     free(shuffled_indices);
     free_gpt(gpt);
+    CHECK_CUDA(cudaFree(d_workspace));
     CHECK_CUBLASLT(cublasLtDestroy(cublaslt_handle));
     
     return 0;

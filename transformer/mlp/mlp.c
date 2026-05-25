@@ -10,11 +10,12 @@
     CHECK_CUBLASLT(cublasLtMatmul(mlp->cublaslt_handle, mlp->matmul_desc, \
                                   alpha, A, layA, B, layB, \
                                   beta, C, layC, \
-                                  C, layC, NULL, NULL, 0, 0)); \
+                                  C, layC, NULL, \
+                                  mlp->d_workspace, mlp->workspace_size, 0)); \
 } while(0)
 
 // Initialize the MLP
-MLP* init_mlp(int input_dim, int hidden_dim, int output_dim, int batch_size, cublasLtHandle_t cublaslt_handle) {
+MLP* init_mlp(int input_dim, int hidden_dim, int output_dim, int batch_size, cublasLtHandle_t cublaslt_handle, void* d_workspace, size_t workspace_size) {
     MLP* mlp = (MLP*)malloc(sizeof(MLP));
     
     // Store dimensions
@@ -32,6 +33,8 @@ MLP* init_mlp(int input_dim, int hidden_dim, int output_dim, int batch_size, cub
     
     // Initialize cuBLASLt
     mlp->cublaslt_handle = cublaslt_handle;
+    mlp->d_workspace = d_workspace;
+    mlp->workspace_size = workspace_size;
     
     size_t w1_size = input_dim * hidden_dim;
     size_t w2_size = hidden_dim * output_dim;
@@ -398,7 +401,7 @@ void serialize_mlp(MLP* mlp, FILE* file) {
 }
 
 // Deserialize MLP from a file
-MLP* deserialize_mlp(FILE* file, int batch_size, cublasLtHandle_t cublaslt_handle) {
+MLP* deserialize_mlp(FILE* file, int batch_size, cublasLtHandle_t cublaslt_handle, void* d_workspace, size_t workspace_size) {
     // Read dimensions
     int input_dim, hidden_dim, output_dim;
     fread(&input_dim, sizeof(int), 1, file);
@@ -406,7 +409,7 @@ MLP* deserialize_mlp(FILE* file, int batch_size, cublasLtHandle_t cublaslt_handl
     fread(&output_dim, sizeof(int), 1, file);
     
     // Initialize MLP
-    MLP* mlp = init_mlp(input_dim, hidden_dim, output_dim, batch_size, cublaslt_handle);
+    MLP* mlp = init_mlp(input_dim, hidden_dim, output_dim, batch_size, cublaslt_handle, d_workspace, workspace_size);
     
     int w1_size = input_dim * hidden_dim;
     int w2_size = hidden_dim * output_dim;

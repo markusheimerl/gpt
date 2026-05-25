@@ -64,9 +64,11 @@ typedef struct {
     // Transformer core
     Transformer* transformer;
     
-    // cuBLASLt handle and descriptor
+    // cuBLASLt handle and descriptor (workspace is borrowed, not owned)
     cublasLtHandle_t cublaslt_handle;
     cublasLtMatmulDesc_t matmul_desc;
+    void* d_workspace;
+    size_t workspace_size;
     
     // Matrix layouts
     cublasLtMatrixLayout_t embedding_layout;          // [vocab_size x d_model]
@@ -83,7 +85,7 @@ typedef struct {
 } GPT;
 
 // Function prototypes
-GPT* init_gpt(int seq_len, int d_model, int hidden_dim, int num_layers, int batch_size, cublasLtHandle_t cublaslt_handle);
+GPT* init_gpt(int seq_len, int d_model, int hidden_dim, int num_layers, int batch_size, cublasLtHandle_t cublaslt_handle, void* d_workspace, size_t workspace_size);
 void free_gpt(GPT* gpt);
 void forward_pass_gpt(GPT* gpt, unsigned char* d_input_tokens);
 float calculate_loss_gpt(GPT* gpt, unsigned char* d_target_tokens);
@@ -92,6 +94,6 @@ void backward_pass_gpt(GPT* gpt, unsigned char* d_input_tokens);
 void update_weights_gpt(GPT* gpt, float learning_rate, int batch_size);
 void reset_optimizer_gpt(GPT* gpt);
 void save_gpt(GPT* gpt, const char* filename);
-GPT* load_gpt(const char* filename, int batch_size, int seq_len, cublasLtHandle_t cublaslt_handle);
+GPT* load_gpt(const char* filename, int batch_size, int seq_len, cublasLtHandle_t cublaslt_handle, void* d_workspace, size_t workspace_size);
 
 #endif

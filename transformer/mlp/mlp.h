@@ -63,9 +63,11 @@ typedef struct {
     // Loss computation buffer
     float* d_loss_result;   // [1]
 
-    // cuBLASLt handle and descriptor
+    // cuBLASLt handle and descriptor (workspace is borrowed, not owned)
     cublasLtHandle_t cublaslt_handle;
     cublasLtMatmulDesc_t matmul_desc;
+    void* d_workspace;
+    size_t workspace_size;
     
     // Matrix layouts
     cublasLtMatrixLayout_t W1_layout;           // [input_dim x hidden_dim]
@@ -82,7 +84,7 @@ typedef struct {
 } MLP;
 
 // Function prototypes
-MLP* init_mlp(int input_dim, int hidden_dim, int output_dim, int batch_size, cublasLtHandle_t cublaslt_handle);
+MLP* init_mlp(int input_dim, int hidden_dim, int output_dim, int batch_size, cublasLtHandle_t cublaslt_handle, void* d_workspace, size_t workspace_size);
 void free_mlp(MLP* mlp);
 void forward_pass_mlp(MLP* mlp, half* d_X);
 float calculate_loss_mlp(MLP* mlp, half* d_y);
@@ -91,6 +93,6 @@ void backward_pass_mlp(MLP* mlp, half* d_X, half* d_grad_X);
 void update_weights_mlp(MLP* mlp, float learning_rate, int batch_size);
 void reset_optimizer_mlp(MLP* mlp);
 void serialize_mlp(MLP* mlp, FILE* file);
-MLP* deserialize_mlp(FILE* file, int batch_size, cublasLtHandle_t cublaslt_handle);
+MLP* deserialize_mlp(FILE* file, int batch_size, cublasLtHandle_t cublaslt_handle, void* d_workspace, size_t workspace_size);
 
 #endif

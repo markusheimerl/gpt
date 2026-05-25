@@ -116,6 +116,9 @@ int main() {
     // Initialize cuBLASLt
     cublasLtHandle_t cublaslt_handle;
     CHECK_CUBLASLT(cublasLtCreate(&cublaslt_handle));
+    void* d_workspace;
+    size_t workspace_size = 32 * 1024 * 1024;
+    CHECK_CUDA(cudaMalloc(&d_workspace, workspace_size));
 
     // Parameters
     const int seq_len = 128;
@@ -135,7 +138,7 @@ int main() {
     for (int i = 0; i < num_samples * seq_len * d_model; i++) h_y[i] = __float2half(y[i]);
     
     // Initialize attention layer
-    Attention* attn = init_attention(seq_len, d_model, num_heads, batch_size, false, false, cublaslt_handle);
+    Attention* attn = init_attention(seq_len, d_model, num_heads, batch_size, false, false, cublaslt_handle, d_workspace, workspace_size);
     
     // Training parameters
     const int num_epochs = 50;
@@ -204,7 +207,7 @@ int main() {
     printf("\nVerifying saved model...\n");
 
     model_file = fopen(model_fname, "rb");
-    Attention* loaded_attn = deserialize_attention(model_file, batch_size, seq_len, num_heads, cublaslt_handle);
+    Attention* loaded_attn = deserialize_attention(model_file, batch_size, seq_len, num_heads, cublaslt_handle, d_workspace, workspace_size);
     fclose(model_file);
     printf("Model loaded from %s\n", model_fname);
 
@@ -273,6 +276,7 @@ int main() {
     CHECK_CUDA(cudaFree(d_y));
     free_attention(attn);
     free_attention(loaded_attn);
+    CHECK_CUDA(cudaFree(d_workspace));
     CHECK_CUBLASLT(cublasLtDestroy(cublaslt_handle));
     
     return 0;

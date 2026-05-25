@@ -10,11 +10,12 @@
     CHECK_CUBLASLT(cublasLtMatmul(attn->cublaslt_handle, attn->matmul_desc, \
                                   alpha, A, layA, B, layB, \
                                   beta, C, layC, \
-                                  C, layC, NULL, NULL, 0, 0)); \
+                                  C, layC, NULL, \
+                                  attn->d_workspace, attn->workspace_size, 0)); \
 } while(0)
 
 // Initialize the attention layer
-Attention* init_attention(int seq_len, int d_model, int num_heads, int batch_size, bool is_causal, bool use_rope, cublasLtHandle_t cublaslt_handle) {
+Attention* init_attention(int seq_len, int d_model, int num_heads, int batch_size, bool is_causal, bool use_rope, cublasLtHandle_t cublaslt_handle, void* d_workspace, size_t workspace_size) {
     Attention* attn = (Attention*)malloc(sizeof(Attention));
     
     // Validate num_heads
@@ -42,6 +43,8 @@ Attention* init_attention(int seq_len, int d_model, int num_heads, int batch_siz
     
     // Initialize cuBLASLt
     attn->cublaslt_handle = cublaslt_handle;
+    attn->d_workspace = d_workspace;
+    attn->workspace_size = workspace_size;
     
     size_t weight_size = d_model * d_model;
     size_t seq_batch_size = batch_size * seq_len * d_model;
@@ -817,7 +820,7 @@ void serialize_attention(Attention* attn, FILE* file) {
 }
 
 // Deserialize attention from file
-Attention* deserialize_attention(FILE* file, int batch_size, int seq_len, int num_heads, cublasLtHandle_t cublaslt_handle) {
+Attention* deserialize_attention(FILE* file, int batch_size, int seq_len, int num_heads, cublasLtHandle_t cublaslt_handle, void* d_workspace, size_t workspace_size) {
     // Read dimension
     int d_model;
     bool is_causal, use_rope;
@@ -826,7 +829,7 @@ Attention* deserialize_attention(FILE* file, int batch_size, int seq_len, int nu
     fread(&use_rope, sizeof(bool), 1, file);
     
     // Initialize attention
-    Attention* attn = init_attention(seq_len, d_model, num_heads, batch_size, is_causal, use_rope, cublaslt_handle);
+    Attention* attn = init_attention(seq_len, d_model, num_heads, batch_size, is_causal, use_rope, cublaslt_handle, d_workspace, workspace_size);
     
     int weight_size = d_model * d_model;
     
