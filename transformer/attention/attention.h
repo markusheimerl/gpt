@@ -79,6 +79,9 @@ typedef struct {
     // Loss computation buffer
     float* d_loss_result;      // [1]
 
+    // cuDNN flash-attention softmax stats (saved by fwd, consumed by bwd)
+    float* d_stats;            // [batch_size x num_heads x seq_len]
+
     // cuBLASLt handle and descriptor
     cublasLtHandle_t cublaslt_handle;
     cublasLtMatmulDesc_t matmul_desc;
@@ -111,5 +114,19 @@ void update_weights_attention(Attention* attn, float learning_rate, int batch_si
 void reset_optimizer_attention(Attention* attn);
 void serialize_attention(Attention* attn, FILE* file);
 Attention* deserialize_attention(FILE* file, int batch_size, int seq_len, int num_heads, cublasLtHandle_t cublaslt_handle);
+
+// cuDNN flash-attention C ABI (defined in cudnn_att.cpp)
+#ifdef __cplusplus
+extern "C" {
+#endif
+void cudnn_attention_forward(void* Q, void* K, void* V, void* O, void* stats,
+                             int B, int NH, int T, int HS, int is_causal);
+void cudnn_attention_backward(void* Q, void* K, void* V, void* O, void* dO, void* stats,
+                              void* dQ, void* dK, void* dV,
+                              int B, int NH, int T, int HS, int is_causal);
+void cudnn_attention_destroy(void);
+#ifdef __cplusplus
+}
+#endif
 
 #endif

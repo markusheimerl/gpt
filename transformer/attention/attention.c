@@ -95,12 +95,15 @@ Attention* init_attention(int seq_len, int d_model, int num_heads, int batch_siz
     
     // Alias/Allocate device memory for backward pass buffers
     attn->d_grad_output = attn->d_output;
-    attn->d_grad_attn_output = attn->d_attn_output;
+    CHECK_CUDA(cudaMalloc(&attn->d_grad_attn_output, seq_batch_size * sizeof(half)));
     CHECK_CUDA(cudaMalloc(&attn->d_grad_weights, attn_matrix_size * sizeof(half)));
     attn->d_grad_scores = attn->d_scores;
-    attn->d_grad_Q = attn->d_attn_output;
-    attn->d_grad_K = attn->d_K;
-    attn->d_grad_V = attn->d_V;
+    CHECK_CUDA(cudaMalloc(&attn->d_grad_Q, seq_batch_size * sizeof(half)));
+    CHECK_CUDA(cudaMalloc(&attn->d_grad_K, seq_batch_size * sizeof(half)));
+    CHECK_CUDA(cudaMalloc(&attn->d_grad_V, seq_batch_size * sizeof(half)));
+
+    // cuDNN softmax stats buffer (B x NH x T)
+    CHECK_CUDA(cudaMalloc(&attn->d_stats, (size_t)batch_size * num_heads * seq_len * sizeof(float)));
     
     // Allocate single device float for loss computation
     CHECK_CUDA(cudaMalloc(&attn->d_loss_result, sizeof(float)));
@@ -176,6 +179,9 @@ void free_attention(Attention* attn) {
     cudaFree(attn->d_scores); cudaFree(attn->d_attn_weights);
     cudaFree(attn->d_attn_output); cudaFree(attn->d_output);
     cudaFree(attn->d_grad_weights);
+    cudaFree(attn->d_grad_attn_output);
+    cudaFree(attn->d_grad_Q); cudaFree(attn->d_grad_K); cudaFree(attn->d_grad_V);
+    cudaFree(attn->d_stats);
     
     // Free loss computation buffer
     cudaFree(attn->d_loss_result);
@@ -475,39 +481,11 @@ void forward_pass_attention(Attention* attn, half* d_X) {
         rope_forward_kernel_attention<<<grid, attn->d_model / 2>>>(attn->d_Q, attn->d_K, attn->batch_size, attn->seq_len, attn->d_model);
     }
     
-    // Step 3: Compute attention scores per head (batched: [L x d_h] * [d_h x L] -> [L x L])
-    // S_h = Q_h K_h^T / √d_h
-    for (int h = 0; h < attn->num_heads; h++) {
-        half* Q_h = attn->d_Q + h * attn->head_dim;
-        half* K_h = attn->d_K + h * attn->head_dim;
-        half* S_h = attn->d_scores + (size_t)h * attn->batch_size * attn->seq_len * attn->seq_len;
-        
-        LT_MATMUL(attn, CUBLAS_OP_N, CUBLAS_OP_T, &attn->scale,
-                  Q_h, attn->head_seq_layout,
-                  K_h, attn->head_seq_layout,
-                  &beta, S_h, attn->attn_batch_layout);
-    }
-    
-    // Step 4: Apply softmax over all (head, batch) matrices
-    dim3 grid(attn->num_heads, attn->batch_size, attn->seq_len);
-    if (attn->is_causal) {
-        softmax_causal_forward_kernel_attention<<<grid, 256, 8 * sizeof(float)>>>(attn->d_attn_weights, attn->d_scores, attn->num_heads, attn->batch_size, attn->seq_len);
-    } else {
-        softmax_forward_kernel_attention<<<grid, 256, 8 * sizeof(float)>>>(attn->d_attn_weights, attn->d_scores, attn->num_heads, attn->batch_size, attn->seq_len);
-    }
-    
-    // Step 5: Compute attention output per head (batched: [L x L] * [L x d_h] -> [L x d_h])
-    // Z_h = A_h V_h
-    for (int h = 0; h < attn->num_heads; h++) {
-        half* A_h = attn->d_attn_weights + (size_t)h * attn->batch_size * attn->seq_len * attn->seq_len;
-        half* V_h = attn->d_V + h * attn->head_dim;
-        half* Z_h = attn->d_attn_output + h * attn->head_dim;
-        
-        LT_MATMUL(attn, CUBLAS_OP_N, CUBLAS_OP_N, &alpha,
-                  A_h, attn->attn_batch_layout,
-                  V_h, attn->head_seq_layout,
-                  &beta, Z_h, attn->head_seq_layout);
-    }
+    // Steps 3-5: cuDNN flash attention (QK^T, softmax, A*V)
+    cudnn_attention_forward(attn->d_Q, attn->d_K, attn->d_V,
+                            attn->d_attn_output, attn->d_stats,
+                            attn->batch_size, attn->num_heads, attn->seq_len, attn->head_dim,
+                            attn->is_causal ? 1 : 0);
     
     // Step 6: Apply output projection (flattened: [B * L x D] * [D x D] -> [B * L x D])
     // Y = ZW_o
@@ -579,55 +557,12 @@ void backward_pass_attention(Attention* attn, half* d_X, half* d_grad_X) {
               attn->d_W_o, attn->weight_layout,
               &beta, attn->d_grad_attn_output, attn->seq_flat_layout);
     
-    // Step 5 (backward): Gradient through attention output computation per head
-    for (int h = 0; h < attn->num_heads; h++) {
-        half* grad_Z_h = attn->d_grad_attn_output + h * attn->head_dim;
-        half* V_h = attn->d_V + h * attn->head_dim;
-        half* A_h = attn->d_attn_weights + (size_t)h * attn->batch_size * attn->seq_len * attn->seq_len;
-        half* grad_A_h = attn->d_grad_weights + (size_t)h * attn->batch_size * attn->seq_len * attn->seq_len;
-        half* grad_V_h = attn->d_grad_V + h * attn->head_dim;
-        
-        // ∂L/∂A_h = (∂L/∂Z_h)V_hᵀ (batched)
-        LT_MATMUL(attn, CUBLAS_OP_N, CUBLAS_OP_T, &alpha,
-                  grad_Z_h, attn->head_seq_layout,
-                  V_h, attn->head_seq_layout,
-                  &beta, grad_A_h, attn->attn_batch_layout);
-        
-        // ∂L/∂V_h = A_hᵀ(∂L/∂Z_h) (batched)
-        LT_MATMUL(attn, CUBLAS_OP_T, CUBLAS_OP_N, &alpha,
-                  A_h, attn->attn_batch_layout,
-                  grad_Z_h, attn->head_seq_layout,
-                  &beta, grad_V_h, attn->head_seq_layout);
-    }
-    
-    // Step 4 (backward): Gradient through softmax
-    dim3 grid(attn->num_heads, attn->batch_size, attn->seq_len);
-    if (attn->is_causal) {
-        softmax_causal_backward_kernel_attention<<<grid, 256, 8 * sizeof(float)>>>(attn->d_grad_scores, attn->d_grad_weights, attn->d_attn_weights, attn->num_heads, attn->batch_size, attn->seq_len);
-    } else {
-        softmax_backward_kernel_attention<<<grid, 256, 8 * sizeof(float)>>>(attn->d_grad_scores, attn->d_grad_weights, attn->d_attn_weights, attn->num_heads, attn->batch_size, attn->seq_len);
-    }
-    
-    // Step 3 (backward): Gradient through attention scores per head
-    for (int h = 0; h < attn->num_heads; h++) {
-        half* grad_S_h = attn->d_grad_scores + (size_t)h * attn->batch_size * attn->seq_len * attn->seq_len;
-        half* Q_h = attn->d_Q + h * attn->head_dim;
-        half* K_h = attn->d_K + h * attn->head_dim;
-        half* grad_Q_h = attn->d_grad_Q + h * attn->head_dim;
-        half* grad_K_h = attn->d_grad_K + h * attn->head_dim;
-        
-        // ∂L/∂Q_h = (∂L/∂S_h)K_h/√d_h (batched)
-        LT_MATMUL(attn, CUBLAS_OP_N, CUBLAS_OP_N, &attn->scale,
-                  grad_S_h, attn->attn_batch_layout,
-                  K_h, attn->head_seq_layout,
-                  &beta, grad_Q_h, attn->head_seq_layout);
-        
-        // ∂L/∂K_h = (∂L/∂S_h)ᵀQ_h/√d_h (batched)
-        LT_MATMUL(attn, CUBLAS_OP_T, CUBLAS_OP_N, &attn->scale,
-                  grad_S_h, attn->attn_batch_layout,
-                  Q_h, attn->head_seq_layout,
-                  &beta, grad_K_h, attn->head_seq_layout);
-    }
+    // Steps 5-3 (backward): cuDNN flash-attention backward in one call
+    cudnn_attention_backward(attn->d_Q, attn->d_K, attn->d_V,
+                             attn->d_attn_output, attn->d_grad_attn_output, attn->d_stats,
+                             attn->d_grad_Q, attn->d_grad_K, attn->d_grad_V,
+                             attn->batch_size, attn->num_heads, attn->seq_len, attn->head_dim,
+                             attn->is_causal ? 1 : 0);
     
     // Step 2 (backward): Apply inverse RoPE to grad_Q and grad_K
     if (attn->use_rope) {
