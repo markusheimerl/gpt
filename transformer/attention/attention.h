@@ -35,44 +35,68 @@
 #endif
 
 typedef struct {
-    // Weights and gradients [d_model x d_model]
-    half *d_W_q, *d_W_k, *d_W_v, *d_W_o;
-    half *d_W_q_grad, *d_W_k_grad, *d_W_v_grad, *d_W_o_grad;
-    
-    // AdamW parameters
-    float *d_W_q_m, *d_W_q_v;
-    float *d_W_k_m, *d_W_k_v;
-    float *d_W_v_m, *d_W_v_v;
-    float *d_W_o_m, *d_W_o_v;
-    float beta1, beta2, epsilon, weight_decay;
-    int t;
-    
-    // Forward pass buffers [batch_size x seq_len x d_model]
-    half *d_Q, *d_K, *d_V;
-    half *d_attn_output;
-    half *d_output;
+    // Weights and gradients
+    half* d_W_q;      // [d_model x d_model]
+    half* d_W_k;      // [d_model x d_model]
+    half* d_W_v;      // [d_model x d_model]
+    half* d_W_o;      // [d_model x d_model]
+    half* d_W_q_grad; // [d_model x d_model]
+    half* d_W_k_grad; // [d_model x d_model]
+    half* d_W_v_grad; // [d_model x d_model]
+    half* d_W_o_grad; // [d_model x d_model]
+
+    // Adam parameters
+    float* d_W_q_m;     // First moment for W_q
+    float* d_W_q_v;     // Second moment for W_q
+    float* d_W_k_m;     // First moment for W_k
+    float* d_W_k_v;     // Second moment for W_k
+    float* d_W_v_m;     // First moment for W_v
+    float* d_W_v_v;     // Second moment for W_v
+    float* d_W_o_m;     // First moment for W_o
+    float* d_W_o_v;     // Second moment for W_o
+    float beta1;        // Exponential decay rate for first moment
+    float beta2;        // Exponential decay rate for second moment
+    float epsilon;      // Small constant for numerical stability
+    int t;              // Time step
+    float weight_decay; // Weight decay parameter for AdamW
+
+    // Forward pass buffers
+    half* d_Q;           // [batch_size x seq_len x d_model]
+    half* d_K;           // [batch_size x seq_len x d_model]
+    half* d_V;           // [batch_size x seq_len x d_model]
+    half* d_attn_output; // [batch_size x seq_len x d_model]
+    half* d_output;      // [batch_size x seq_len x d_model]
 
     // Backward pass buffers
-    half *d_grad_output;
-    half *d_grad_attn_output;
-    half *d_grad_Q, *d_grad_K, *d_grad_V;
+    half* d_grad_output;      // [batch_size x seq_len x d_model]
+    half* d_grad_attn_output; // [batch_size x seq_len x d_model]
+    half* d_grad_Q;           // [batch_size x seq_len x d_model]
+    half* d_grad_K;           // [batch_size x seq_len x d_model]
+    half* d_grad_V;           // [batch_size x seq_len x d_model]
 
-    // Loss accumulator
-    float* d_loss_result;
+    // Loss computation buffer
+    float* d_loss_result;     // [1]
 
-    // Flash-attention softmax stats (LSE per (b,h,t)); saved by fwd, consumed by bwd
-    float* d_stats;
+    // Flash-attention softmax stats
+    float* d_stats;           // [batch_size x num_heads x seq_len]
 
-    // cuBLASLt handle, descriptor, and layouts
+    // cuBLASLt handle and descriptor
     cublasLtHandle_t cublaslt_handle;
     cublasLtMatmulDesc_t matmul_desc;
-    cublasLtMatrixLayout_t weight_layout;     // [d_model x d_model]
-    cublasLtMatrixLayout_t seq_flat_layout;   // [batch_size * seq_len x d_model]
-    
+
+    // Matrix layouts
+    cublasLtMatrixLayout_t weight_layout;   // [d_model x d_model]
+    cublasLtMatrixLayout_t seq_flat_layout; // [batch_size * seq_len x d_model]
+
     // Dimensions
-    int seq_len, d_model, batch_size, num_heads, head_dim;
+    int seq_len;
+    int d_model;
+    int batch_size;
+    int num_heads;
+    int head_dim;
     float scale;
-    bool is_causal, use_rope;
+    bool is_causal;
+    bool use_rope;
 } Attention;
 
 // Function prototypes
