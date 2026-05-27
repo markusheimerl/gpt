@@ -35,72 +35,44 @@
 #endif
 
 typedef struct {
-    // Device weights for attention mechanism
-    half* d_W_q;      // Query projection [d_model x d_model]
-    half* d_W_k;      // Key projection [d_model x d_model]
-    half* d_W_v;      // Value projection [d_model x d_model]
-    half* d_W_o;      // Output projection [d_model x d_model]
+    // Weights and gradients [d_model x d_model]
+    half *d_W_q, *d_W_k, *d_W_v, *d_W_o;
+    half *d_W_q_grad, *d_W_k_grad, *d_W_v_grad, *d_W_o_grad;
     
-    // Device gradients
-    half* d_W_q_grad; // [d_model x d_model]
-    half* d_W_k_grad; // [d_model x d_model]
-    half* d_W_v_grad; // [d_model x d_model]
-    half* d_W_o_grad; // [d_model x d_model]
+    // AdamW parameters
+    float *d_W_q_m, *d_W_q_v;
+    float *d_W_k_m, *d_W_k_v;
+    float *d_W_v_m, *d_W_v_v;
+    float *d_W_o_m, *d_W_o_v;
+    float beta1, beta2, epsilon, weight_decay;
+    int t;
     
-    // Adam parameters
-    float* d_W_q_m, *d_W_q_v;  // First and second moments for W_q
-    float* d_W_k_m, *d_W_k_v;  // First and second moments for W_k
-    float* d_W_v_m, *d_W_v_v;  // First and second moments for W_v
-    float* d_W_o_m, *d_W_o_v;  // First and second moments for W_o
-    float beta1;               // Exponential decay rate for first moment
-    float beta2;               // Exponential decay rate for second moment
-    float epsilon;             // Small constant for numerical stability
-    int t;                     // Time step
-    float weight_decay;        // Weight decay parameter for AdamW
-    
-    // Forward pass buffers
-    half* d_Q;            // Query matrix [batch_size x seq_len x d_model]
-    half* d_K;            // Key matrix [batch_size x seq_len x d_model]
-    half* d_V;            // Value matrix [batch_size x seq_len x d_model]
-    half* d_scores;       // Attention scores [num_heads x batch_size x seq_len x seq_len]
-    half* d_attn_weights; // Attention weights [num_heads x batch_size x seq_len x seq_len]
-    half* d_attn_output;  // Attention output [batch_size x seq_len x d_model]
-    half* d_output;       // Final output [batch_size x seq_len x d_model]
+    // Forward pass buffers [batch_size x seq_len x d_model]
+    half *d_Q, *d_K, *d_V;
+    half *d_attn_output;  // Output of softmax(QKᵀ/√d)V
+    half *d_output;       // Final output after W_o projection
     
     // Backward pass buffers
-    half* d_grad_output;      // [batch_size x seq_len x d_model]
-    half* d_grad_attn_output; // [batch_size x seq_len x d_model]
-    half* d_grad_weights;     // [num_heads x batch_size x seq_len x seq_len]
-    half* d_grad_scores;      // [num_heads x batch_size x seq_len x seq_len]
-    half* d_grad_Q;           // [batch_size x seq_len x d_model]
-    half* d_grad_K;           // [batch_size x seq_len x d_model]
-    half* d_grad_V;           // [batch_size x seq_len x d_model]
+    half *d_grad_output;       // Alias of d_output
+    half *d_grad_attn_output;
+    half *d_grad_Q, *d_grad_K, *d_grad_V;
 
-    // Loss computation buffer
-    float* d_loss_result;      // [1]
+    // Loss accumulator
+    float* d_loss_result;
 
     // cuDNN flash-attention softmax stats (saved by fwd, consumed by bwd)
-    float* d_stats;            // [batch_size x num_heads x seq_len]
+    float* d_stats;  // [batch_size x num_heads x seq_len]
 
-    // cuBLASLt handle and descriptor
+    // cuBLASLt handle, descriptor, and layouts
     cublasLtHandle_t cublaslt_handle;
     cublasLtMatmulDesc_t matmul_desc;
-    
-    // Matrix layouts
     cublasLtMatrixLayout_t weight_layout;     // [d_model x d_model]
     cublasLtMatrixLayout_t seq_flat_layout;   // [batch_size * seq_len x d_model]
-    cublasLtMatrixLayout_t head_seq_layout;   // [seq_len x head_dim] batched
-    cublasLtMatrixLayout_t attn_batch_layout; // [seq_len x seq_len] batched
     
     // Dimensions
-    int seq_len;
-    int d_model;
-    int batch_size;
-    int num_heads;
-    int head_dim;
+    int seq_len, d_model, batch_size, num_heads, head_dim;
     float scale;
-    bool is_causal;
-    bool use_rope;
+    bool is_causal, use_rope;
 } Attention;
 
 // Function prototypes
