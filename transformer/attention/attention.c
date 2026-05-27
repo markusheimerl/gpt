@@ -1,8 +1,6 @@
 #include "attention.h"
 #include <mma.h>
 
-namespace wmma = nvcuda::wmma;
-
 // ============================================================================
 // Flash attention (FA2-style, WMMA tensor cores).
 // Layout: half tensors with logical (B,NH,T,HS) over [B,T,NH,HS] physical memory.
@@ -52,9 +50,9 @@ __global__ static void flash_fwd_kernel(const half* __restrict__ Q, const half* 
     load_tile(Qs, Q + bh, m_start, T, NH);
     __syncthreads();
 
-    wmma::fragment<wmma::accumulator,16,16,16,float> O_frag[HT];
+    nvcuda::wmma::fragment<nvcuda::wmma::accumulator,16,16,16,float> O_frag[HT];
     #pragma unroll
-    for (int k = 0; k < HT; k++) wmma::fill_fragment(O_frag[k], 0.f);
+    for (int k = 0; k < HT; k++) nvcuda::wmma::fill_fragment(O_frag[k], 0.f);
 
     const int n_end = is_causal ? min(T, m_start+BM) : T;
     for (int n_start = 0; n_start < n_end; n_start += BN) {
@@ -63,23 +61,23 @@ __global__ static void flash_fwd_kernel(const half* __restrict__ Q, const half* 
         __syncthreads();
 
         // S = Q K^T
-        wmma::fragment<wmma::accumulator,16,16,16,float> S_frag[NT];
+        nvcuda::wmma::fragment<nvcuda::wmma::accumulator,16,16,16,float> S_frag[NT];
         #pragma unroll
-        for (int j = 0; j < NT; j++) wmma::fill_fragment(S_frag[j], 0.f);
+        for (int j = 0; j < NT; j++) nvcuda::wmma::fill_fragment(S_frag[j], 0.f);
         #pragma unroll
         for (int k = 0; k < HT; k++) {
-            wmma::fragment<wmma::matrix_a,16,16,16,half,wmma::row_major> a;
-            wmma::load_matrix_sync(a, Qs + warp*RPW*HS + k*16, HS);
+            nvcuda::wmma::fragment<nvcuda::wmma::matrix_a,16,16,16,half,nvcuda::wmma::row_major> a;
+            nvcuda::wmma::load_matrix_sync(a, Qs + warp*RPW*HS + k*16, HS);
             #pragma unroll
             for (int j = 0; j < NT; j++) {
-                wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::col_major> bf;
-                wmma::load_matrix_sync(bf, Ks + j*16*HS + k*16, HS);
-                wmma::mma_sync(S_frag[j], a, bf, S_frag[j]);
+                nvcuda::wmma::fragment<nvcuda::wmma::matrix_b,16,16,16,half,nvcuda::wmma::col_major> bf;
+                nvcuda::wmma::load_matrix_sync(bf, Ks + j*16*HS + k*16, HS);
+                nvcuda::wmma::mma_sync(S_frag[j], a, bf, S_frag[j]);
             }
         }
         #pragma unroll
         for (int j = 0; j < NT; j++)
-            wmma::store_matrix_sync(Sf + warp*RPW*BN + j*16, S_frag[j], BN, wmma::mem_row_major);
+            nvcuda::wmma::store_matrix_sync(Sf + warp*RPW*BN + j*16, S_frag[j], BN, nvcuda::wmma::mem_row_major);
         __syncwarp();
 
         // Online softmax: mask, find row max, exponentiate, update running (m, l, alpha)
@@ -112,7 +110,7 @@ __global__ static void flash_fwd_kernel(const half* __restrict__ Q, const half* 
         float* O_sc = Sf;
         #pragma unroll
         for (int k = 0; k < HT; k++)
-            wmma::store_matrix_sync(O_sc + warp*RPW*HS + k*16, O_frag[k], HS, wmma::mem_row_major);
+            nvcuda::wmma::store_matrix_sync(O_sc + warp*RPW*HS + k*16, O_frag[k], HS, nvcuda::wmma::mem_row_major);
         __syncwarp();
         if (lane < RPW) {
             int gr = warp*RPW + lane;
@@ -123,18 +121,18 @@ __global__ static void flash_fwd_kernel(const half* __restrict__ Q, const half* 
         __syncwarp();
         #pragma unroll
         for (int k = 0; k < HT; k++)
-            wmma::load_matrix_sync(O_frag[k], O_sc + warp*RPW*HS + k*16, HS, wmma::mem_row_major);
+            nvcuda::wmma::load_matrix_sync(O_frag[k], O_sc + warp*RPW*HS + k*16, HS, nvcuda::wmma::mem_row_major);
 
         // O += P V
         #pragma unroll
         for (int k = 0; k < NT; k++) {
-            wmma::fragment<wmma::matrix_a,16,16,16,half,wmma::row_major> a;
-            wmma::load_matrix_sync(a, Ps + warp*RPW*BN + k*16, BN);
+            nvcuda::wmma::fragment<nvcuda::wmma::matrix_a,16,16,16,half,nvcuda::wmma::row_major> a;
+            nvcuda::wmma::load_matrix_sync(a, Ps + warp*RPW*BN + k*16, BN);
             #pragma unroll
             for (int j = 0; j < HT; j++) {
-                wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::row_major> bf;
-                wmma::load_matrix_sync(bf, Vs + k*16*HS + j*16, HS);
-                wmma::mma_sync(O_frag[j], a, bf, O_frag[j]);
+                nvcuda::wmma::fragment<nvcuda::wmma::matrix_b,16,16,16,half,nvcuda::wmma::row_major> bf;
+                nvcuda::wmma::load_matrix_sync(bf, Vs + k*16*HS + j*16, HS);
+                nvcuda::wmma::mma_sync(O_frag[j], a, bf, O_frag[j]);
             }
         }
         __syncthreads();
@@ -144,7 +142,7 @@ __global__ static void flash_fwd_kernel(const half* __restrict__ Q, const half* 
     float* O_sc = Sf;
     #pragma unroll
     for (int k = 0; k < HT; k++)
-        wmma::store_matrix_sync(O_sc + warp*RPW*HS + k*16, O_frag[k], HS, wmma::mem_row_major);
+        nvcuda::wmma::store_matrix_sync(O_sc + warp*RPW*HS + k*16, O_frag[k], HS, nvcuda::wmma::mem_row_major);
     __syncwarp();
     if (lane < RPW) {
         int gr = warp*RPW + lane, t = m_start + gr;
@@ -212,9 +210,9 @@ __global__ static void flash_bwd_kernel(const half* __restrict__ Q, const half* 
     }
     __syncthreads();
 
-    wmma::fragment<wmma::accumulator,16,16,16,float> dQ_frag[HT];
+    nvcuda::wmma::fragment<nvcuda::wmma::accumulator,16,16,16,float> dQ_frag[HT];
     #pragma unroll
-    for (int k = 0; k < HT; k++) wmma::fill_fragment(dQ_frag[k], 0.f);
+    for (int k = 0; k < HT; k++) nvcuda::wmma::fill_fragment(dQ_frag[k], 0.f);
 
     const int n_end = is_causal ? min(T, m_start+BM) : T;
     for (int n_start = 0; n_start < n_end; n_start += BN) {
@@ -223,23 +221,23 @@ __global__ static void flash_bwd_kernel(const half* __restrict__ Q, const half* 
         __syncthreads();
 
         // S = Q K^T
-        wmma::fragment<wmma::accumulator,16,16,16,float> S_frag[NT];
+        nvcuda::wmma::fragment<nvcuda::wmma::accumulator,16,16,16,float> S_frag[NT];
         #pragma unroll
-        for (int j = 0; j < NT; j++) wmma::fill_fragment(S_frag[j], 0.f);
+        for (int j = 0; j < NT; j++) nvcuda::wmma::fill_fragment(S_frag[j], 0.f);
         #pragma unroll
         for (int k = 0; k < HT; k++) {
-            wmma::fragment<wmma::matrix_a,16,16,16,half,wmma::row_major> a;
-            wmma::load_matrix_sync(a, Qs + warp*RPW*HS + k*16, HS);
+            nvcuda::wmma::fragment<nvcuda::wmma::matrix_a,16,16,16,half,nvcuda::wmma::row_major> a;
+            nvcuda::wmma::load_matrix_sync(a, Qs + warp*RPW*HS + k*16, HS);
             #pragma unroll
             for (int j = 0; j < NT; j++) {
-                wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::col_major> bf;
-                wmma::load_matrix_sync(bf, Ks + j*16*HS + k*16, HS);
-                wmma::mma_sync(S_frag[j], a, bf, S_frag[j]);
+                nvcuda::wmma::fragment<nvcuda::wmma::matrix_b,16,16,16,half,nvcuda::wmma::col_major> bf;
+                nvcuda::wmma::load_matrix_sync(bf, Ks + j*16*HS + k*16, HS);
+                nvcuda::wmma::mma_sync(S_frag[j], a, bf, S_frag[j]);
             }
         }
         #pragma unroll
         for (int j = 0; j < NT; j++)
-            wmma::store_matrix_sync(Sf + warp*RPW*BN + j*16, S_frag[j], BN, wmma::mem_row_major);
+            nvcuda::wmma::store_matrix_sync(Sf + warp*RPW*BN + j*16, S_frag[j], BN, nvcuda::wmma::mem_row_major);
         __syncwarp();
 
         // Recompute P = softmax(S * scale - LSE)
@@ -257,23 +255,23 @@ __global__ static void flash_bwd_kernel(const half* __restrict__ Q, const half* 
         __syncthreads();
 
         // dV += P^T dO  (atomic accumulation into global dV)
-        wmma::fragment<wmma::accumulator,16,16,16,float> dV_frag[HT];
+        nvcuda::wmma::fragment<nvcuda::wmma::accumulator,16,16,16,float> dV_frag[HT];
         #pragma unroll
-        for (int k = 0; k < HT; k++) wmma::fill_fragment(dV_frag[k], 0.f);
+        for (int k = 0; k < HT; k++) nvcuda::wmma::fill_fragment(dV_frag[k], 0.f);
         #pragma unroll
         for (int k = 0; k < (BM/16); k++) {
-            wmma::fragment<wmma::matrix_a,16,16,16,half,wmma::col_major> a;
-            wmma::load_matrix_sync(a, Ps + k*16*BN + warp*RPW, BN);
+            nvcuda::wmma::fragment<nvcuda::wmma::matrix_a,16,16,16,half,nvcuda::wmma::col_major> a;
+            nvcuda::wmma::load_matrix_sync(a, Ps + k*16*BN + warp*RPW, BN);
             #pragma unroll
             for (int j = 0; j < HT; j++) {
-                wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::row_major> bf;
-                wmma::load_matrix_sync(bf, dOs + k*16*HS + j*16, HS);
-                wmma::mma_sync(dV_frag[j], a, bf, dV_frag[j]);
+                nvcuda::wmma::fragment<nvcuda::wmma::matrix_b,16,16,16,half,nvcuda::wmma::row_major> bf;
+                nvcuda::wmma::load_matrix_sync(bf, dOs + k*16*HS + j*16, HS);
+                nvcuda::wmma::mma_sync(dV_frag[j], a, bf, dV_frag[j]);
             }
         }
         #pragma unroll
         for (int j = 0; j < HT; j++)
-            wmma::store_matrix_sync(dV_sc + warp*16*HS + j*16, dV_frag[j], HS, wmma::mem_row_major);
+            nvcuda::wmma::store_matrix_sync(dV_sc + warp*16*HS + j*16, dV_frag[j], HS, nvcuda::wmma::mem_row_major);
         __syncwarp();
         for (int i = lane; i < 16*HS; i += WSIZE) {
             int r = i/HS, d = i%HS, t_k = n_start + warp*16 + r;
@@ -282,23 +280,23 @@ __global__ static void flash_bwd_kernel(const half* __restrict__ Q, const half* 
         __syncthreads();
 
         // dP = dO V^T
-        wmma::fragment<wmma::accumulator,16,16,16,float> dP_frag[NT];
+        nvcuda::wmma::fragment<nvcuda::wmma::accumulator,16,16,16,float> dP_frag[NT];
         #pragma unroll
-        for (int j = 0; j < NT; j++) wmma::fill_fragment(dP_frag[j], 0.f);
+        for (int j = 0; j < NT; j++) nvcuda::wmma::fill_fragment(dP_frag[j], 0.f);
         #pragma unroll
         for (int k = 0; k < HT; k++) {
-            wmma::fragment<wmma::matrix_a,16,16,16,half,wmma::row_major> a;
-            wmma::load_matrix_sync(a, dOs + warp*RPW*HS + k*16, HS);
+            nvcuda::wmma::fragment<nvcuda::wmma::matrix_a,16,16,16,half,nvcuda::wmma::row_major> a;
+            nvcuda::wmma::load_matrix_sync(a, dOs + warp*RPW*HS + k*16, HS);
             #pragma unroll
             for (int j = 0; j < NT; j++) {
-                wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::col_major> bf;
-                wmma::load_matrix_sync(bf, Vs + j*16*HS + k*16, HS);
-                wmma::mma_sync(dP_frag[j], a, bf, dP_frag[j]);
+                nvcuda::wmma::fragment<nvcuda::wmma::matrix_b,16,16,16,half,nvcuda::wmma::col_major> bf;
+                nvcuda::wmma::load_matrix_sync(bf, Vs + j*16*HS + k*16, HS);
+                nvcuda::wmma::mma_sync(dP_frag[j], a, bf, dP_frag[j]);
             }
         }
         #pragma unroll
         for (int j = 0; j < NT; j++)
-            wmma::store_matrix_sync(Sf + warp*RPW*BN + j*16, dP_frag[j], BN, wmma::mem_row_major);
+            nvcuda::wmma::store_matrix_sync(Sf + warp*RPW*BN + j*16, dP_frag[j], BN, nvcuda::wmma::mem_row_major);
         __syncwarp();
 
         // dS = P * (dP - D)
@@ -319,34 +317,34 @@ __global__ static void flash_bwd_kernel(const half* __restrict__ Q, const half* 
         // dQ += dS K  (accumulated across n tiles in registers)
         #pragma unroll
         for (int k = 0; k < NT; k++) {
-            wmma::fragment<wmma::matrix_a,16,16,16,half,wmma::row_major> a;
-            wmma::load_matrix_sync(a, dSs + warp*RPW*BN + k*16, BN);
+            nvcuda::wmma::fragment<nvcuda::wmma::matrix_a,16,16,16,half,nvcuda::wmma::row_major> a;
+            nvcuda::wmma::load_matrix_sync(a, dSs + warp*RPW*BN + k*16, BN);
             #pragma unroll
             for (int j = 0; j < HT; j++) {
-                wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::row_major> bf;
-                wmma::load_matrix_sync(bf, Ks + k*16*HS + j*16, HS);
-                wmma::mma_sync(dQ_frag[j], a, bf, dQ_frag[j]);
+                nvcuda::wmma::fragment<nvcuda::wmma::matrix_b,16,16,16,half,nvcuda::wmma::row_major> bf;
+                nvcuda::wmma::load_matrix_sync(bf, Ks + k*16*HS + j*16, HS);
+                nvcuda::wmma::mma_sync(dQ_frag[j], a, bf, dQ_frag[j]);
             }
         }
 
         // dK += dS^T Q * scale  (atomic accumulation into global dK)
-        wmma::fragment<wmma::accumulator,16,16,16,float> dK_frag[HT];
+        nvcuda::wmma::fragment<nvcuda::wmma::accumulator,16,16,16,float> dK_frag[HT];
         #pragma unroll
-        for (int k = 0; k < HT; k++) wmma::fill_fragment(dK_frag[k], 0.f);
+        for (int k = 0; k < HT; k++) nvcuda::wmma::fill_fragment(dK_frag[k], 0.f);
         #pragma unroll
         for (int k = 0; k < (BM/16); k++) {
-            wmma::fragment<wmma::matrix_a,16,16,16,half,wmma::col_major> a;
-            wmma::load_matrix_sync(a, dSs + k*16*BN + warp*RPW, BN);
+            nvcuda::wmma::fragment<nvcuda::wmma::matrix_a,16,16,16,half,nvcuda::wmma::col_major> a;
+            nvcuda::wmma::load_matrix_sync(a, dSs + k*16*BN + warp*RPW, BN);
             #pragma unroll
             for (int j = 0; j < HT; j++) {
-                wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::row_major> bf;
-                wmma::load_matrix_sync(bf, Qs + k*16*HS + j*16, HS);
-                wmma::mma_sync(dK_frag[j], a, bf, dK_frag[j]);
+                nvcuda::wmma::fragment<nvcuda::wmma::matrix_b,16,16,16,half,nvcuda::wmma::row_major> bf;
+                nvcuda::wmma::load_matrix_sync(bf, Qs + k*16*HS + j*16, HS);
+                nvcuda::wmma::mma_sync(dK_frag[j], a, bf, dK_frag[j]);
             }
         }
         #pragma unroll
         for (int j = 0; j < HT; j++)
-            wmma::store_matrix_sync(dK_sc + warp*16*HS + j*16, dK_frag[j], HS, wmma::mem_row_major);
+            nvcuda::wmma::store_matrix_sync(dK_sc + warp*16*HS + j*16, dK_frag[j], HS, nvcuda::wmma::mem_row_major);
         __syncwarp();
         for (int i = lane; i < 16*HS; i += WSIZE) {
             int r = i/HS, d = i%HS, t_k = n_start + warp*16 + r;
@@ -358,7 +356,7 @@ __global__ static void flash_bwd_kernel(const half* __restrict__ Q, const half* 
     // Write dQ * scale
     #pragma unroll
     for (int k = 0; k < HT; k++)
-        wmma::store_matrix_sync(dQ_sc + warp*RPW*HS + k*16, dQ_frag[k], HS, wmma::mem_row_major);
+        nvcuda::wmma::store_matrix_sync(dQ_sc + warp*RPW*HS + k*16, dQ_frag[k], HS, nvcuda::wmma::mem_row_major);
     __syncwarp();
     if (lane < RPW) {
         int gr = warp*RPW + lane, t = m_start + gr;
