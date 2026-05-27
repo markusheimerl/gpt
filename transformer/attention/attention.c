@@ -415,9 +415,7 @@ static void flash_attention_backward(const half* Q, const half* K, const half* V
     }
 }
 
-// ============================================================================
 // cuBLASLt matrix multiplication macro
-// ============================================================================
 #define LT_MATMUL(attn, opA, opB, alpha, A, layA, B, layB, beta, C, layC) do { \
     cublasOperation_t _opA = opA, _opB = opB; \
     CHECK_CUBLASLT(cublasLtMatmulDescSetAttribute(attn->matmul_desc, \
@@ -438,6 +436,8 @@ Attention* init_attention(int seq_len, int d_model, int num_heads, int batch_siz
     }
 
     Attention* attn = (Attention*)malloc(sizeof(Attention));
+
+    // Store dimensions
     attn->seq_len = seq_len;
     attn->d_model = d_model;
     attn->batch_size = batch_size;
@@ -447,22 +447,27 @@ Attention* init_attention(int seq_len, int d_model, int num_heads, int batch_siz
     attn->is_causal = is_causal;
     attn->use_rope = use_rope;
 
+    // Initialize Adam parameters
     attn->beta1 = 0.9f;
     attn->beta2 = 0.999f;
     attn->epsilon = 1e-8f;
     attn->t = 0;
     attn->weight_decay = 0.01f;
 
+    // Initialize cuBLASLt
     attn->cublaslt_handle = cublaslt_handle;
 
     size_t weight_size = d_model * d_model;
     size_t seq_batch_size = batch_size * seq_len * d_model;
 
-    float scale_W = 1.0f / sqrtf(d_model);
+    // Allocate host memory for weight initialization
     half* h_W_q = (half*)malloc(weight_size * sizeof(half));
     half* h_W_k = (half*)malloc(weight_size * sizeof(half));
     half* h_W_v = (half*)malloc(weight_size * sizeof(half));
     half* h_W_o = (half*)malloc(weight_size * sizeof(half));
+
+    // Initialize weights on host
+    float scale_W = 1.0f / sqrtf(d_model);
 
     for (size_t i = 0; i < weight_size; i++) {
         h_W_q[i] = __float2half(((float)rand() / (float)RAND_MAX * 2.0f - 1.0f) * scale_W);
@@ -471,6 +476,7 @@ Attention* init_attention(int seq_len, int d_model, int num_heads, int batch_siz
         h_W_o[i] = __float2half(((float)rand() / (float)RAND_MAX * 2.0f - 1.0f) * scale_W);
     }
 
+    // Allocate device memory for weights and gradients
     CHECK_CUDA(cudaMalloc(&attn->d_W_q, weight_size * sizeof(half)));
     CHECK_CUDA(cudaMalloc(&attn->d_W_k, weight_size * sizeof(half)));
     CHECK_CUDA(cudaMalloc(&attn->d_W_v, weight_size * sizeof(half)));
@@ -480,6 +486,7 @@ Attention* init_attention(int seq_len, int d_model, int num_heads, int batch_siz
     CHECK_CUDA(cudaMalloc(&attn->d_W_v_grad, weight_size * sizeof(half)));
     CHECK_CUDA(cudaMalloc(&attn->d_W_o_grad, weight_size * sizeof(half)));
 
+    // Allocate device memory for Adam parameters
     CHECK_CUDA(cudaMalloc(&attn->d_W_q_m, weight_size * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&attn->d_W_q_v, weight_size * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&attn->d_W_k_m, weight_size * sizeof(float)));
@@ -489,26 +496,33 @@ Attention* init_attention(int seq_len, int d_model, int num_heads, int batch_siz
     CHECK_CUDA(cudaMalloc(&attn->d_W_o_m, weight_size * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&attn->d_W_o_v, weight_size * sizeof(float)));
 
+    // Allocate device memory for forward pass buffers
     CHECK_CUDA(cudaMalloc(&attn->d_Q, seq_batch_size * sizeof(half)));
     CHECK_CUDA(cudaMalloc(&attn->d_K, seq_batch_size * sizeof(half)));
     CHECK_CUDA(cudaMalloc(&attn->d_V, seq_batch_size * sizeof(half)));
     CHECK_CUDA(cudaMalloc(&attn->d_attn_output, seq_batch_size * sizeof(half)));
     CHECK_CUDA(cudaMalloc(&attn->d_output, seq_batch_size * sizeof(half)));
 
+    // Alias/Allocate device memory for backward pass buffers
     attn->d_grad_output = attn->d_output;
     CHECK_CUDA(cudaMalloc(&attn->d_grad_attn_output, seq_batch_size * sizeof(half)));
     CHECK_CUDA(cudaMalloc(&attn->d_grad_Q, seq_batch_size * sizeof(half)));
     CHECK_CUDA(cudaMalloc(&attn->d_grad_K, seq_batch_size * sizeof(half)));
     CHECK_CUDA(cudaMalloc(&attn->d_grad_V, seq_batch_size * sizeof(half)));
 
+    // Allocate device memory for flash-attention softmax stats
     CHECK_CUDA(cudaMalloc(&attn->d_stats, (size_t)batch_size * num_heads * seq_len * sizeof(float)));
+
+    // Allocate single device float for loss computation
     CHECK_CUDA(cudaMalloc(&attn->d_loss_result, sizeof(float)));
 
+    // Copy weights to device
     CHECK_CUDA(cudaMemcpy(attn->d_W_q, h_W_q, weight_size * sizeof(half), cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(attn->d_W_k, h_W_k, weight_size * sizeof(half), cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(attn->d_W_v, h_W_v, weight_size * sizeof(half), cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(attn->d_W_o, h_W_o, weight_size * sizeof(half), cudaMemcpyHostToDevice));
 
+    // Initialize Adam parameters to zero
     CHECK_CUDA(cudaMemset(attn->d_W_q_m, 0, weight_size * sizeof(float)));
     CHECK_CUDA(cudaMemset(attn->d_W_q_v, 0, weight_size * sizeof(float)));
     CHECK_CUDA(cudaMemset(attn->d_W_k_m, 0, weight_size * sizeof(float)));
@@ -518,39 +532,56 @@ Attention* init_attention(int seq_len, int d_model, int num_heads, int batch_siz
     CHECK_CUDA(cudaMemset(attn->d_W_o_m, 0, weight_size * sizeof(float)));
     CHECK_CUDA(cudaMemset(attn->d_W_o_v, 0, weight_size * sizeof(float)));
 
+    // Create cuBLASLt matrix multiplication descriptor
     CHECK_CUBLASLT(cublasLtMatmulDescCreate(&attn->matmul_desc, CUBLAS_COMPUTE_32F_FAST_TF32, CUDA_R_32F));
+
+    // Row-major layout order
     cublasLtOrder_t order = CUBLASLT_ORDER_ROW;
 
+    // Create matrix layout descriptors
+    // W_q, W_k, W_v, W_o and their gradients: [d_model x d_model]
     CHECK_CUBLASLT(cublasLtMatrixLayoutCreate(&attn->weight_layout, CUDA_R_16F, d_model, d_model, d_model));
     CHECK_CUBLASLT(cublasLtMatrixLayoutSetAttribute(attn->weight_layout, CUBLASLT_MATRIX_LAYOUT_ORDER, &order, sizeof(order)));
 
+    // X, Q, K, V, attn_output, output and their gradients: [batch_size * seq_len x d_model]
     CHECK_CUBLASLT(cublasLtMatrixLayoutCreate(&attn->seq_flat_layout, CUDA_R_16F, batch_size * seq_len, d_model, d_model));
     CHECK_CUBLASLT(cublasLtMatrixLayoutSetAttribute(attn->seq_flat_layout, CUBLASLT_MATRIX_LAYOUT_ORDER, &order, sizeof(order)));
 
+    // Free host memory
     free(h_W_q); free(h_W_k); free(h_W_v); free(h_W_o);
 
     return attn;
 }
 
+// Free attention memory
 void free_attention(Attention* attn) {
+    // Destroy cuBLASLt descriptor
     cublasLtMatmulDescDestroy(attn->matmul_desc);
+
+    // Destroy matrix layouts
     cublasLtMatrixLayoutDestroy(attn->weight_layout);
     cublasLtMatrixLayoutDestroy(attn->seq_flat_layout);
 
+    // Free device memory
     cudaFree(attn->d_W_q); cudaFree(attn->d_W_k); cudaFree(attn->d_W_v); cudaFree(attn->d_W_o);
     cudaFree(attn->d_W_q_grad); cudaFree(attn->d_W_k_grad); cudaFree(attn->d_W_v_grad); cudaFree(attn->d_W_o_grad);
-    cudaFree(attn->d_W_q_m); cudaFree(attn->d_W_q_v); cudaFree(attn->d_W_k_m); cudaFree(attn->d_W_k_v);
-    cudaFree(attn->d_W_v_m); cudaFree(attn->d_W_v_v); cudaFree(attn->d_W_o_m); cudaFree(attn->d_W_o_v);
+    cudaFree(attn->d_W_q_m); cudaFree(attn->d_W_q_v);
+    cudaFree(attn->d_W_k_m); cudaFree(attn->d_W_k_v);
+    cudaFree(attn->d_W_v_m); cudaFree(attn->d_W_v_v);
+    cudaFree(attn->d_W_o_m); cudaFree(attn->d_W_o_v);
     cudaFree(attn->d_Q); cudaFree(attn->d_K); cudaFree(attn->d_V);
     cudaFree(attn->d_attn_output); cudaFree(attn->d_output);
     cudaFree(attn->d_grad_attn_output);
     cudaFree(attn->d_grad_Q); cudaFree(attn->d_grad_K); cudaFree(attn->d_grad_V);
     cudaFree(attn->d_stats);
+
+    // Free loss computation buffer
     cudaFree(attn->d_loss_result);
 
     free(attn);
 }
 
+// CUDA kernel for RoPE forward pass
 __global__ static void rope_forward_kernel_attention(half* Q, half* K, int batch_size, int seq_len, int d_model) {
     int b = blockIdx.x;
     int t = blockIdx.y;
@@ -573,6 +604,7 @@ __global__ static void rope_forward_kernel_attention(half* Q, half* K, int batch
     K[idx + 1] = __float2half(k0 * sin_a + k1 * cos_a);
 }
 
+// CUDA kernel for RoPE backward pass
 __global__ static void rope_backward_kernel_attention(half* grad_Q, half* grad_K, int batch_size, int seq_len, int d_model) {
     int b = blockIdx.x;
     int t = blockIdx.y;
@@ -597,37 +629,51 @@ __global__ static void rope_backward_kernel_attention(half* grad_Q, half* grad_K
 
 // Forward pass
 void forward_pass_attention(Attention* attn, half* d_X) {
-    const float alpha = 1.0f, beta = 0.0f;
-    
-    // Q, K, V = XW_q, XW_k, XW_v
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+
+    // Q = XW_q
     LT_MATMUL(attn, CUBLAS_OP_N, CUBLAS_OP_N, &alpha,
-              d_X, attn->seq_flat_layout, attn->d_W_q, attn->weight_layout,
+              d_X, attn->seq_flat_layout,
+              attn->d_W_q, attn->weight_layout,
               &beta, attn->d_Q, attn->seq_flat_layout);
+
+    // K = XW_k
     LT_MATMUL(attn, CUBLAS_OP_N, CUBLAS_OP_N, &alpha,
-              d_X, attn->seq_flat_layout, attn->d_W_k, attn->weight_layout,
+              d_X, attn->seq_flat_layout,
+              attn->d_W_k, attn->weight_layout,
               &beta, attn->d_K, attn->seq_flat_layout);
+
+    // V = XW_v
     LT_MATMUL(attn, CUBLAS_OP_N, CUBLAS_OP_N, &alpha,
-              d_X, attn->seq_flat_layout, attn->d_W_v, attn->weight_layout,
+              d_X, attn->seq_flat_layout,
+              attn->d_W_v, attn->weight_layout,
               &beta, attn->d_V, attn->seq_flat_layout);
 
+    // Apply rotary positional embeddings to Q and K
     if (attn->use_rope) {
         dim3 grid(attn->batch_size, attn->seq_len);
         rope_forward_kernel_attention<<<grid, attn->d_model / 2>>>(
-            attn->d_Q, attn->d_K, attn->batch_size, attn->seq_len, attn->d_model);
+            attn->d_Q, attn->d_K, attn->batch_size, attn->seq_len, attn->d_model
+        );
     }
 
     // Z = softmax(QK^T/√d) V
-    flash_attention_forward(attn->d_Q, attn->d_K, attn->d_V,
-                            attn->d_attn_output, attn->d_stats,
-                            attn->batch_size, attn->num_heads, attn->seq_len, attn->head_dim,
-                            attn->is_causal ? 1 : 0);
+    flash_attention_forward(
+        attn->d_Q, attn->d_K, attn->d_V,
+        attn->d_attn_output, attn->d_stats,
+        attn->batch_size, attn->num_heads, attn->seq_len, attn->head_dim,
+        attn->is_causal ? 1 : 0
+    );
 
     // Y = ZW_o
     LT_MATMUL(attn, CUBLAS_OP_N, CUBLAS_OP_N, &alpha,
-              attn->d_attn_output, attn->seq_flat_layout, attn->d_W_o, attn->weight_layout,
+              attn->d_attn_output, attn->seq_flat_layout,
+              attn->d_W_o, attn->weight_layout,
               &beta, attn->d_output, attn->seq_flat_layout);
 }
 
+// CUDA kernel for computing loss and gradient
 __global__ static void compute_loss_and_gradient_kernel_attention(half* grad_output, half* predictions, half* targets, float* loss_result, int size) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < size) {
@@ -639,114 +685,176 @@ __global__ static void compute_loss_and_gradient_kernel_attention(half* grad_out
     }
 }
 
+// Calculate loss
 float calculate_loss_attention(Attention* attn, half* d_y) {
+    // ∂L/∂Y = Y - Y_true
     int total_elements = attn->batch_size * attn->seq_len * attn->d_model;
     int block_size = 256;
     int num_blocks = (total_elements + block_size - 1) / block_size;
 
+    // Reset loss accumulator to zero
     CHECK_CUDA(cudaMemset(attn->d_loss_result, 0, sizeof(float)));
-    compute_loss_and_gradient_kernel_attention<<<num_blocks, block_size>>>(
-        attn->d_grad_output, attn->d_output, d_y, attn->d_loss_result, total_elements);
 
+    // Compute gradient and accumulate loss
+    compute_loss_and_gradient_kernel_attention<<<num_blocks, block_size>>>(
+        attn->d_grad_output, attn->d_output, d_y, attn->d_loss_result, total_elements
+    );
+
+    // Copy result back to host
     float total_loss;
     CHECK_CUDA(cudaMemcpy(&total_loss, attn->d_loss_result, sizeof(float), cudaMemcpyDeviceToHost));
+
     return total_loss / total_elements;
 }
 
+// Zero gradients
 void zero_gradients_attention(Attention* attn) {
     int weight_size = attn->d_model * attn->d_model;
+
     CHECK_CUDA(cudaMemset(attn->d_W_q_grad, 0, weight_size * sizeof(half)));
     CHECK_CUDA(cudaMemset(attn->d_W_k_grad, 0, weight_size * sizeof(half)));
     CHECK_CUDA(cudaMemset(attn->d_W_v_grad, 0, weight_size * sizeof(half)));
     CHECK_CUDA(cudaMemset(attn->d_W_o_grad, 0, weight_size * sizeof(half)));
 }
 
+// Backward pass
 void backward_pass_attention(Attention* attn, half* d_X, half* d_grad_X) {
-    const float alpha = 1.0f, beta = 0.0f;
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
 
-    // ∂L/∂W_o = Z^T(∂L/∂Y);  ∂L/∂Z = (∂L/∂Y)W_o^T
+    // ∂L/∂W_o = Z^T(∂L/∂Y)
     LT_MATMUL(attn, CUBLAS_OP_T, CUBLAS_OP_N, &alpha,
-              attn->d_attn_output, attn->seq_flat_layout, attn->d_grad_output, attn->seq_flat_layout,
-              &beta, attn->d_W_o_grad, attn->weight_layout);
+              attn->d_attn_output, attn->seq_flat_layout,
+              attn->d_grad_output, attn->seq_flat_layout,
+              &alpha, attn->d_W_o_grad, attn->weight_layout);
+
+    // ∂L/∂Z = (∂L/∂Y)W_o^T
     LT_MATMUL(attn, CUBLAS_OP_N, CUBLAS_OP_T, &alpha,
-              attn->d_grad_output, attn->seq_flat_layout, attn->d_W_o, attn->weight_layout,
+              attn->d_grad_output, attn->seq_flat_layout,
+              attn->d_W_o, attn->weight_layout,
               &beta, attn->d_grad_attn_output, attn->seq_flat_layout);
 
-    // (∂L/∂Q, ∂L/∂K, ∂L/∂V)
-    flash_attention_backward(attn->d_Q, attn->d_K, attn->d_V,
-                             attn->d_attn_output, attn->d_grad_attn_output, attn->d_stats,
-                             attn->d_grad_Q, attn->d_grad_K, attn->d_grad_V,
-                             attn->batch_size, attn->num_heads, attn->seq_len, attn->head_dim,
-                             attn->is_causal ? 1 : 0);
+    // ∂L/∂Q, ∂L/∂K, ∂L/∂V via flash attention backward
+    flash_attention_backward(
+        attn->d_Q, attn->d_K, attn->d_V,
+        attn->d_attn_output, attn->d_grad_attn_output, attn->d_stats,
+        attn->d_grad_Q, attn->d_grad_K, attn->d_grad_V,
+        attn->batch_size, attn->num_heads, attn->seq_len, attn->head_dim,
+        attn->is_causal ? 1 : 0
+    );
 
+    // Apply rotary positional embeddings backward to grad_Q and grad_K
     if (attn->use_rope) {
         dim3 grid(attn->batch_size, attn->seq_len);
         rope_backward_kernel_attention<<<grid, attn->d_model / 2>>>(
-            attn->d_grad_Q, attn->d_grad_K, attn->batch_size, attn->seq_len, attn->d_model);
+            attn->d_grad_Q, attn->d_grad_K, attn->batch_size, attn->seq_len, attn->d_model
+        );
     }
 
+    // ∂L/∂W_q = X^T(∂L/∂Q)
     LT_MATMUL(attn, CUBLAS_OP_T, CUBLAS_OP_N, &alpha,
-              d_X, attn->seq_flat_layout, attn->d_grad_Q, attn->seq_flat_layout,
-              &beta, attn->d_W_q_grad, attn->weight_layout);
+              d_X, attn->seq_flat_layout,
+              attn->d_grad_Q, attn->seq_flat_layout,
+              &alpha, attn->d_W_q_grad, attn->weight_layout);
+
+    // ∂L/∂W_k = X^T(∂L/∂K)
     LT_MATMUL(attn, CUBLAS_OP_T, CUBLAS_OP_N, &alpha,
-              d_X, attn->seq_flat_layout, attn->d_grad_K, attn->seq_flat_layout,
-              &beta, attn->d_W_k_grad, attn->weight_layout);
+              d_X, attn->seq_flat_layout,
+              attn->d_grad_K, attn->seq_flat_layout,
+              &alpha, attn->d_W_k_grad, attn->weight_layout);
+
+    // ∂L/∂W_v = X^T(∂L/∂V)
     LT_MATMUL(attn, CUBLAS_OP_T, CUBLAS_OP_N, &alpha,
-              d_X, attn->seq_flat_layout, attn->d_grad_V, attn->seq_flat_layout,
-              &beta, attn->d_W_v_grad, attn->weight_layout);
+              d_X, attn->seq_flat_layout,
+              attn->d_grad_V, attn->seq_flat_layout,
+              &alpha, attn->d_W_v_grad, attn->weight_layout);
 
     if (d_grad_X != NULL) {
+        // ∂L/∂X = (∂L/∂Q)W_q^T + (∂L/∂K)W_k^T + (∂L/∂V)W_v^T
         LT_MATMUL(attn, CUBLAS_OP_N, CUBLAS_OP_T, &alpha,
-                  attn->d_grad_Q, attn->seq_flat_layout, attn->d_W_q, attn->weight_layout,
-                  &beta,  d_grad_X, attn->seq_flat_layout);
+                  attn->d_grad_Q, attn->seq_flat_layout,
+                  attn->d_W_q, attn->weight_layout,
+                  &beta, d_grad_X, attn->seq_flat_layout);
+
         LT_MATMUL(attn, CUBLAS_OP_N, CUBLAS_OP_T, &alpha,
-                  attn->d_grad_K, attn->seq_flat_layout, attn->d_W_k, attn->weight_layout,
+                  attn->d_grad_K, attn->seq_flat_layout,
+                  attn->d_W_k, attn->weight_layout,
                   &alpha, d_grad_X, attn->seq_flat_layout);
+
         LT_MATMUL(attn, CUBLAS_OP_N, CUBLAS_OP_T, &alpha,
-                  attn->d_grad_V, attn->seq_flat_layout, attn->d_W_v, attn->weight_layout,
+                  attn->d_grad_V, attn->seq_flat_layout,
+                  attn->d_W_v, attn->weight_layout,
                   &alpha, d_grad_X, attn->seq_flat_layout);
     }
 }
 
+// CUDA kernel for AdamW update
 __global__ static void adamw_update_kernel_attention(half* weight, half* grad, float* m, float* v,
                                                      float beta1, float beta2, float epsilon, float learning_rate,
                                                      float weight_decay, float alpha_t, int size, int batch_size) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < size) {
         float g = __half2float(grad[idx]) / batch_size;
+
+        // m = β₁m + (1-β₁)(∂L/∂W)
         m[idx] = beta1 * m[idx] + (1.0f - beta1) * g;
+        // v = β₂v + (1-β₂)(∂L/∂W)²
         v[idx] = beta2 * v[idx] + (1.0f - beta2) * g * g;
+
         float update = alpha_t * m[idx] / (sqrtf(v[idx]) + epsilon);
+        // W = (1-λη)W - η(m/(1-β₁ᵗ))/√(v/(1-β₂ᵗ) + ε)
         float w = __half2float(weight[idx]);
         weight[idx] = __float2half(w * (1.0f - learning_rate * weight_decay) - update);
     }
 }
 
+// Update weights using AdamW
 void update_weights_attention(Attention* attn, float learning_rate, int batch_size) {
     attn->t++;
+
     float beta1_t = powf(attn->beta1, attn->t);
     float beta2_t = powf(attn->beta2, attn->t);
     float alpha_t = learning_rate * sqrtf(1.0f - beta2_t) / (1.0f - beta1_t);
 
-    int weight_size = attn->d_model * attn->d_model;
     int block_size = 256;
-    int num_blocks = (weight_size + block_size - 1) / block_size;
 
-    half*  weights[] = {attn->d_W_q,      attn->d_W_k,      attn->d_W_v,      attn->d_W_o};
-    half*  grads[]   = {attn->d_W_q_grad, attn->d_W_k_grad, attn->d_W_v_grad, attn->d_W_o_grad};
-    float* ms[]      = {attn->d_W_q_m,    attn->d_W_k_m,    attn->d_W_v_m,    attn->d_W_o_m};
-    float* vs[]      = {attn->d_W_q_v,    attn->d_W_k_v,    attn->d_W_v_v,    attn->d_W_o_v};
+    int weight_size = attn->d_model * attn->d_model;
+    int weight_blocks = (weight_size + block_size - 1) / block_size;
 
-    for (int w = 0; w < 4; w++) {
-        adamw_update_kernel_attention<<<num_blocks, block_size>>>(
-            weights[w], grads[w], ms[w], vs[w],
-            attn->beta1, attn->beta2, attn->epsilon, learning_rate, attn->weight_decay,
-            alpha_t, weight_size, batch_size);
-    }
+    // Update W_q weights
+    adamw_update_kernel_attention<<<weight_blocks, block_size>>>(
+        attn->d_W_q, attn->d_W_q_grad, attn->d_W_q_m, attn->d_W_q_v,
+        attn->beta1, attn->beta2, attn->epsilon, learning_rate, attn->weight_decay,
+        alpha_t, weight_size, batch_size
+    );
+
+    // Update W_k weights
+    adamw_update_kernel_attention<<<weight_blocks, block_size>>>(
+        attn->d_W_k, attn->d_W_k_grad, attn->d_W_k_m, attn->d_W_k_v,
+        attn->beta1, attn->beta2, attn->epsilon, learning_rate, attn->weight_decay,
+        alpha_t, weight_size, batch_size
+    );
+
+    // Update W_v weights
+    adamw_update_kernel_attention<<<weight_blocks, block_size>>>(
+        attn->d_W_v, attn->d_W_v_grad, attn->d_W_v_m, attn->d_W_v_v,
+        attn->beta1, attn->beta2, attn->epsilon, learning_rate, attn->weight_decay,
+        alpha_t, weight_size, batch_size
+    );
+
+    // Update W_o weights
+    adamw_update_kernel_attention<<<weight_blocks, block_size>>>(
+        attn->d_W_o, attn->d_W_o_grad, attn->d_W_o_m, attn->d_W_o_v,
+        attn->beta1, attn->beta2, attn->epsilon, learning_rate, attn->weight_decay,
+        alpha_t, weight_size, batch_size
+    );
 }
 
+// Reset optimizer state
 void reset_optimizer_attention(Attention* attn) {
     int weight_size = attn->d_model * attn->d_model;
+
+    // Reset Adam moment estimates to zero on device
     CHECK_CUDA(cudaMemset(attn->d_W_q_m, 0, weight_size * sizeof(float)));
     CHECK_CUDA(cudaMemset(attn->d_W_q_v, 0, weight_size * sizeof(float)));
     CHECK_CUDA(cudaMemset(attn->d_W_k_m, 0, weight_size * sizeof(float)));
@@ -755,34 +863,39 @@ void reset_optimizer_attention(Attention* attn) {
     CHECK_CUDA(cudaMemset(attn->d_W_v_v, 0, weight_size * sizeof(float)));
     CHECK_CUDA(cudaMemset(attn->d_W_o_m, 0, weight_size * sizeof(float)));
     CHECK_CUDA(cudaMemset(attn->d_W_o_v, 0, weight_size * sizeof(float)));
+
+    // Reset time step
     attn->t = 0;
 }
 
-// Serialize attention to file
+// Serialize attention to a file
 void serialize_attention(Attention* attn, FILE* file) {
-    fwrite(&attn->d_model,   sizeof(int),  1, file);
+    // Write dimensions
+    fwrite(&attn->d_model, sizeof(int), 1, file);
     fwrite(&attn->is_causal, sizeof(bool), 1, file);
-    fwrite(&attn->use_rope,  sizeof(bool), 1, file);
+    fwrite(&attn->use_rope, sizeof(bool), 1, file);
 
     int weight_size = attn->d_model * attn->d_model;
 
+    // Allocate host buffers for weights
     float* h_W_q = (float*)malloc(weight_size * sizeof(float));
     float* h_W_k = (float*)malloc(weight_size * sizeof(float));
     float* h_W_v = (float*)malloc(weight_size * sizeof(float));
     float* h_W_o = (float*)malloc(weight_size * sizeof(float));
 
+    // Copy weights from device
     CHECK_CUDA(cudaMemcpy(h_W_q, attn->d_W_q, weight_size * sizeof(half), cudaMemcpyDeviceToHost));
     CHECK_CUDA(cudaMemcpy(h_W_k, attn->d_W_k, weight_size * sizeof(half), cudaMemcpyDeviceToHost));
     CHECK_CUDA(cudaMemcpy(h_W_v, attn->d_W_v, weight_size * sizeof(half), cudaMemcpyDeviceToHost));
     CHECK_CUDA(cudaMemcpy(h_W_o, attn->d_W_o, weight_size * sizeof(half), cudaMemcpyDeviceToHost));
 
-    for (int i = weight_size - 1; i >= 0; i--) {
-        h_W_q[i] = __half2float(((half*)h_W_q)[i]);
-        h_W_k[i] = __half2float(((half*)h_W_k)[i]);
-        h_W_v[i] = __half2float(((half*)h_W_v)[i]);
-        h_W_o[i] = __half2float(((half*)h_W_o)[i]);
-    }
+    // Convert half to float
+    for (int i = weight_size - 1; i >= 0; i--) h_W_q[i] = __half2float(((half*)h_W_q)[i]);
+    for (int i = weight_size - 1; i >= 0; i--) h_W_k[i] = __half2float(((half*)h_W_k)[i]);
+    for (int i = weight_size - 1; i >= 0; i--) h_W_v[i] = __half2float(((half*)h_W_v)[i]);
+    for (int i = weight_size - 1; i >= 0; i--) h_W_o[i] = __half2float(((half*)h_W_o)[i]);
 
+    // Write weights
     fwrite(h_W_q, sizeof(float), weight_size, file);
     fwrite(h_W_k, sizeof(float), weight_size, file);
     fwrite(h_W_v, sizeof(float), weight_size, file);
@@ -790,8 +903,10 @@ void serialize_attention(Attention* attn, FILE* file) {
 
     free(h_W_q); free(h_W_k); free(h_W_v); free(h_W_o);
 
+    // Write optimizer state
     fwrite(&attn->t, sizeof(int), 1, file);
 
+    // Allocate host buffers for optimizer state
     float* h_W_q_m = (float*)malloc(weight_size * sizeof(float));
     float* h_W_q_v = (float*)malloc(weight_size * sizeof(float));
     float* h_W_k_m = (float*)malloc(weight_size * sizeof(float));
@@ -801,6 +916,7 @@ void serialize_attention(Attention* attn, FILE* file) {
     float* h_W_o_m = (float*)malloc(weight_size * sizeof(float));
     float* h_W_o_v = (float*)malloc(weight_size * sizeof(float));
 
+    // Copy optimizer state from device
     CHECK_CUDA(cudaMemcpy(h_W_q_m, attn->d_W_q_m, weight_size * sizeof(float), cudaMemcpyDeviceToHost));
     CHECK_CUDA(cudaMemcpy(h_W_q_v, attn->d_W_q_v, weight_size * sizeof(float), cudaMemcpyDeviceToHost));
     CHECK_CUDA(cudaMemcpy(h_W_k_m, attn->d_W_k_m, weight_size * sizeof(float), cudaMemcpyDeviceToHost));
@@ -810,6 +926,7 @@ void serialize_attention(Attention* attn, FILE* file) {
     CHECK_CUDA(cudaMemcpy(h_W_o_m, attn->d_W_o_m, weight_size * sizeof(float), cudaMemcpyDeviceToHost));
     CHECK_CUDA(cudaMemcpy(h_W_o_v, attn->d_W_o_v, weight_size * sizeof(float), cudaMemcpyDeviceToHost));
 
+    // Write optimizer state
     fwrite(h_W_q_m, sizeof(float), weight_size, file);
     fwrite(h_W_q_v, sizeof(float), weight_size, file);
     fwrite(h_W_k_m, sizeof(float), weight_size, file);
@@ -819,38 +936,46 @@ void serialize_attention(Attention* attn, FILE* file) {
     fwrite(h_W_o_m, sizeof(float), weight_size, file);
     fwrite(h_W_o_v, sizeof(float), weight_size, file);
 
-    free(h_W_q_m); free(h_W_q_v); free(h_W_k_m); free(h_W_k_v);
-    free(h_W_v_m); free(h_W_v_v); free(h_W_o_m); free(h_W_o_v);
+    // Free host buffers
+    free(h_W_q_m); free(h_W_q_v);
+    free(h_W_k_m); free(h_W_k_v);
+    free(h_W_v_m); free(h_W_v_v);
+    free(h_W_o_m); free(h_W_o_v);
 }
 
+// Deserialize attention from a file
 Attention* deserialize_attention(FILE* file, int batch_size, int seq_len, int num_heads, cublasLtHandle_t cublaslt_handle) {
+    // Read dimensions
     int d_model;
     bool is_causal, use_rope;
-    fread(&d_model,   sizeof(int),  1, file);
+    fread(&d_model, sizeof(int), 1, file);
     fread(&is_causal, sizeof(bool), 1, file);
-    fread(&use_rope,  sizeof(bool), 1, file);
+    fread(&use_rope, sizeof(bool), 1, file);
 
+    // Initialize attention
     Attention* attn = init_attention(seq_len, d_model, num_heads, batch_size, is_causal, use_rope, cublaslt_handle);
 
     int weight_size = d_model * d_model;
 
+    // Allocate host buffers for weights
     float* h_W_q = (float*)malloc(weight_size * sizeof(float));
     float* h_W_k = (float*)malloc(weight_size * sizeof(float));
     float* h_W_v = (float*)malloc(weight_size * sizeof(float));
     float* h_W_o = (float*)malloc(weight_size * sizeof(float));
 
+    // Read weights
     fread(h_W_q, sizeof(float), weight_size, file);
     fread(h_W_k, sizeof(float), weight_size, file);
     fread(h_W_v, sizeof(float), weight_size, file);
     fread(h_W_o, sizeof(float), weight_size, file);
 
-    for (int i = 0; i < weight_size; i++) {
-        ((half*)h_W_q)[i] = __float2half(h_W_q[i]);
-        ((half*)h_W_k)[i] = __float2half(h_W_k[i]);
-        ((half*)h_W_v)[i] = __float2half(h_W_v[i]);
-        ((half*)h_W_o)[i] = __float2half(h_W_o[i]);
-    }
+    // Convert float to half
+    for (int i = 0; i < weight_size; i++) ((half*)h_W_q)[i] = __float2half(h_W_q[i]);
+    for (int i = 0; i < weight_size; i++) ((half*)h_W_k)[i] = __float2half(h_W_k[i]);
+    for (int i = 0; i < weight_size; i++) ((half*)h_W_v)[i] = __float2half(h_W_v[i]);
+    for (int i = 0; i < weight_size; i++) ((half*)h_W_o)[i] = __float2half(h_W_o[i]);
 
+    // Copy weights to device
     CHECK_CUDA(cudaMemcpy(attn->d_W_q, h_W_q, weight_size * sizeof(half), cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(attn->d_W_k, h_W_k, weight_size * sizeof(half), cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(attn->d_W_v, h_W_v, weight_size * sizeof(half), cudaMemcpyHostToDevice));
@@ -858,8 +983,10 @@ Attention* deserialize_attention(FILE* file, int batch_size, int seq_len, int nu
 
     free(h_W_q); free(h_W_k); free(h_W_v); free(h_W_o);
 
+    // Read optimizer state
     fread(&attn->t, sizeof(int), 1, file);
 
+    // Allocate host buffers for optimizer state
     float* h_W_q_m = (float*)malloc(weight_size * sizeof(float));
     float* h_W_q_v = (float*)malloc(weight_size * sizeof(float));
     float* h_W_k_m = (float*)malloc(weight_size * sizeof(float));
@@ -869,6 +996,7 @@ Attention* deserialize_attention(FILE* file, int batch_size, int seq_len, int nu
     float* h_W_o_m = (float*)malloc(weight_size * sizeof(float));
     float* h_W_o_v = (float*)malloc(weight_size * sizeof(float));
 
+    // Read optimizer state
     fread(h_W_q_m, sizeof(float), weight_size, file);
     fread(h_W_q_v, sizeof(float), weight_size, file);
     fread(h_W_k_m, sizeof(float), weight_size, file);
@@ -878,6 +1006,7 @@ Attention* deserialize_attention(FILE* file, int batch_size, int seq_len, int nu
     fread(h_W_o_m, sizeof(float), weight_size, file);
     fread(h_W_o_v, sizeof(float), weight_size, file);
 
+    // Copy optimizer state to device
     CHECK_CUDA(cudaMemcpy(attn->d_W_q_m, h_W_q_m, weight_size * sizeof(float), cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(attn->d_W_q_v, h_W_q_v, weight_size * sizeof(float), cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(attn->d_W_k_m, h_W_k_m, weight_size * sizeof(float), cudaMemcpyHostToDevice));
@@ -887,8 +1016,11 @@ Attention* deserialize_attention(FILE* file, int batch_size, int seq_len, int nu
     CHECK_CUDA(cudaMemcpy(attn->d_W_o_m, h_W_o_m, weight_size * sizeof(float), cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(attn->d_W_o_v, h_W_o_v, weight_size * sizeof(float), cudaMemcpyHostToDevice));
 
-    free(h_W_q_m); free(h_W_q_v); free(h_W_k_m); free(h_W_k_v);
-    free(h_W_v_m); free(h_W_v_v); free(h_W_o_m); free(h_W_o_v);
+    // Free host buffers
+    free(h_W_q_m); free(h_W_q_v);
+    free(h_W_k_m); free(h_W_k_v);
+    free(h_W_v_m); free(h_W_v_v);
+    free(h_W_o_m); free(h_W_o_v);
 
     return attn;
 }
