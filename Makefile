@@ -4,10 +4,10 @@ LDFLAGS = -lopenblas -lm -flto
 
 ARCH ?= sm_86
 CUDAFLAGS = --cuda-gpu-arch=$(ARCH) -x cuda
-CUDALIBS = -lcudart -lcublasLt -lcudnn -lstdc++
+CUDALIBS = -lcudart -lcublasLt
 
-train.out: gpt.o transformer/transformer.o transformer/attention/attention.o transformer/attention/cudnn_att.o transformer/mlp/mlp.o train.o
-	$(CC) gpt.o transformer/transformer.o transformer/attention/attention.o transformer/attention/cudnn_att.o transformer/mlp/mlp.o train.o $(CUDALIBS) $(LDFLAGS) -o $@
+train.out: gpt.o transformer/transformer.o transformer/attention/attention.o transformer/mlp/mlp.o train.o
+	$(CC) gpt.o transformer/transformer.o transformer/attention/attention.o transformer/mlp/mlp.o train.o $(CUDALIBS) $(LDFLAGS) -o $@
 
 gpt.o: gpt.c gpt.h
 	$(CC) $(CFLAGS) $(CUDAFLAGS) -c gpt.c -o $@
@@ -17,9 +17,6 @@ transformer/transformer.o:
 
 transformer/attention/attention.o:
 	$(MAKE) -C transformer/attention/ attention.o
-
-transformer/attention/cudnn_att.o:
-	$(MAKE) -C transformer/attention/ cudnn_att.o
 
 transformer/mlp/mlp.o:
 	$(MAKE) -C transformer/mlp/ mlp.o
