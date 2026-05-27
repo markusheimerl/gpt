@@ -1,7 +1,7 @@
 #include "attention.h"
 #include <mma.h>
 
-using namespace nvcuda;
+namespace wmma = nvcuda::wmma;
 
 // ============================================================================
 // Flash attention (FA2-style, WMMA tensor cores).
@@ -9,14 +9,13 @@ using namespace nvcuda;
 // d_stats stores log-sum-exp per (B,NH,T) for the backward pass.
 // ============================================================================
 static constexpr int BM = 64, BN = 64, NWARPS = 4, WSIZE = 32, RPW = BM / NWARPS;
+static constexpr int HS = 64, HT = HS / 16, NT = BN / 16;
 
-template<int ROWS, int HS>
-__device__ __forceinline__ void load_tile(half* dst, const half* base,
-                                          int t0, int T, int NH) {
-    constexpr int LPR = HS / 8;
-    constexpr int LT  = ROWS * LPR;
-    constexpr int LPT = LT / (NWARPS * WSIZE);
-    static_assert(LT % (NWARPS * WSIZE) == 0, "tile must divide into 16B lines");
+// Cooperative 16B-vectorized tile load: copies a [BM x HS] tile from global memory
+__device__ static inline void load_tile(half* dst, const half* base, int t0, int T, int NH) {
+    const int LPR = HS / 8;
+    const int LT  = BM * LPR;
+    const int LPT = LT / (NWARPS * WSIZE);
     const int tid = threadIdx.x;
     #pragma unroll
     for (int i = 0; i < LPT; i++) {
@@ -29,14 +28,10 @@ __device__ __forceinline__ void load_tile(half* dst, const half* base,
     }
 }
 
-template<int HS>
-__global__ __launch_bounds__(NWARPS*WSIZE, 2)
-static void flash_fwd_kernel(const half* __restrict__ Q, const half* __restrict__ K,
-                             const half* __restrict__ V, half* __restrict__ O,
-                             float* __restrict__ stats, int T, int NH, int is_causal, float scale) {
-    static_assert(HS % 16 == 0 && HS <= BN && HS % 8 == 0, "");
-    constexpr int HT = HS/16, NT = BN/16;
-
+// Flash attention forward kernel
+__global__ static void flash_fwd_kernel(const half* __restrict__ Q, const half* __restrict__ K,
+                                        const half* __restrict__ V, half* __restrict__ O,
+                                        float* __restrict__ stats, int T, int NH, int is_causal, float scale) {
     const int b = blockIdx.z, h = blockIdx.y, mb = blockIdx.x;
     const int m_start = mb*BM;
     if (m_start >= T) return;
@@ -49,46 +44,50 @@ static void flash_fwd_kernel(const half* __restrict__ Q, const half* __restrict_
     half*  Vs = Ks + BN*HS;
     half*  Ps = Vs + BN*HS;
     float* Sf = (float*)(Ps + BM*BN);
-    float* mi = Sf + BM*BN, *li = mi + BM, *al = li + BM;
+    float* mi = Sf + BM*BN;
+    float* li = mi + BM;
+    float* al = li + BM;
 
     if (tid < BM) { mi[tid] = -1e30f; li[tid] = 0.f; }
-    load_tile<BM, HS>(Qs, Q + bh, m_start, T, NH);
+    load_tile(Qs, Q + bh, m_start, T, NH);
     __syncthreads();
 
     wmma::fragment<wmma::accumulator,16,16,16,float> O_frag[HT];
     #pragma unroll
-    for (int k=0;k<HT;k++) wmma::fill_fragment(O_frag[k], 0.f);
+    for (int k = 0; k < HT; k++) wmma::fill_fragment(O_frag[k], 0.f);
 
     const int n_end = is_causal ? min(T, m_start+BM) : T;
     for (int n_start = 0; n_start < n_end; n_start += BN) {
-        load_tile<BN, HS>(Ks, K + bh, n_start, T, NH);
-        load_tile<BN, HS>(Vs, V + bh, n_start, T, NH);
+        load_tile(Ks, K + bh, n_start, T, NH);
+        load_tile(Vs, V + bh, n_start, T, NH);
         __syncthreads();
 
+        // S = Q K^T
         wmma::fragment<wmma::accumulator,16,16,16,float> S_frag[NT];
         #pragma unroll
-        for (int j=0;j<NT;j++) wmma::fill_fragment(S_frag[j], 0.f);
+        for (int j = 0; j < NT; j++) wmma::fill_fragment(S_frag[j], 0.f);
         #pragma unroll
-        for (int k=0;k<HT;k++) {
+        for (int k = 0; k < HT; k++) {
             wmma::fragment<wmma::matrix_a,16,16,16,half,wmma::row_major> a;
             wmma::load_matrix_sync(a, Qs + warp*RPW*HS + k*16, HS);
             #pragma unroll
-            for (int j=0;j<NT;j++) {
+            for (int j = 0; j < NT; j++) {
                 wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::col_major> bf;
                 wmma::load_matrix_sync(bf, Ks + j*16*HS + k*16, HS);
                 wmma::mma_sync(S_frag[j], a, bf, S_frag[j]);
             }
         }
         #pragma unroll
-        for (int j=0;j<NT;j++)
+        for (int j = 0; j < NT; j++)
             wmma::store_matrix_sync(Sf + warp*RPW*BN + j*16, S_frag[j], BN, wmma::mem_row_major);
         __syncwarp();
 
+        // Online softmax: mask, find row max, exponentiate, update running (m, l, alpha)
         if (lane < RPW) {
             int gr = warp*RPW + lane, t_q = m_start + gr;
             float rmax = -1e30f;
             #pragma unroll
-            for (int c=0;c<BN;c++) {
+            for (int c = 0; c < BN; c++) {
                 int t_k = n_start + c;
                 float s = Sf[gr*BN+c]*scale;
                 bool ok = (t_k<T) & (t_q<T) & (!is_causal | (t_k<=t_q));
@@ -100,7 +99,7 @@ static void flash_fwd_kernel(const half* __restrict__ Q, const half* __restrict_
             float alpha = (m_old == -1e30f) ? 0.f : expf(m_old - m_new);
             float rs = 0.f;
             #pragma unroll
-            for (int c=0;c<BN;c++) {
+            for (int c = 0; c < BN; c++) {
                 float p = (rmax == -1e30f) ? 0.f : expf(Sf[gr*BN+c] - m_new);
                 Ps[gr*BN+c] = __float2half(p);
                 rs += p;
@@ -109,27 +108,30 @@ static void flash_fwd_kernel(const half* __restrict__ Q, const half* __restrict_
         }
         __syncthreads();
 
+        // Rescale running output accumulator: O *= alpha
         float* O_sc = Sf;
         #pragma unroll
-        for (int k=0;k<HT;k++)
+        for (int k = 0; k < HT; k++)
             wmma::store_matrix_sync(O_sc + warp*RPW*HS + k*16, O_frag[k], HS, wmma::mem_row_major);
         __syncwarp();
         if (lane < RPW) {
-            int gr = warp*RPW + lane; float a = al[gr];
+            int gr = warp*RPW + lane;
+            float a = al[gr];
             #pragma unroll
-            for (int d=0; d<HS; d++) O_sc[gr*HS + d] *= a;
+            for (int d = 0; d < HS; d++) O_sc[gr*HS + d] *= a;
         }
         __syncwarp();
         #pragma unroll
-        for (int k=0;k<HT;k++)
+        for (int k = 0; k < HT; k++)
             wmma::load_matrix_sync(O_frag[k], O_sc + warp*RPW*HS + k*16, HS, wmma::mem_row_major);
 
+        // O += P V
         #pragma unroll
-        for (int k=0;k<NT;k++) {
+        for (int k = 0; k < NT; k++) {
             wmma::fragment<wmma::matrix_a,16,16,16,half,wmma::row_major> a;
             wmma::load_matrix_sync(a, Ps + warp*RPW*BN + k*16, BN);
             #pragma unroll
-            for (int j=0;j<HT;j++) {
+            for (int j = 0; j < HT; j++) {
                 wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::row_major> bf;
                 wmma::load_matrix_sync(bf, Vs + k*16*HS + j*16, HS);
                 wmma::mma_sync(O_frag[j], a, bf, O_frag[j]);
@@ -138,9 +140,10 @@ static void flash_fwd_kernel(const half* __restrict__ Q, const half* __restrict_
         __syncthreads();
     }
 
+    // Normalize by row sum and write final output; save LSE for backward
     float* O_sc = Sf;
     #pragma unroll
-    for (int k=0;k<HT;k++)
+    for (int k = 0; k < HT; k++)
         wmma::store_matrix_sync(O_sc + warp*RPW*HS + k*16, O_frag[k], HS, wmma::mem_row_major);
     __syncwarp();
     if (lane < RPW) {
@@ -148,23 +151,19 @@ static void flash_fwd_kernel(const half* __restrict__ Q, const half* __restrict_
         if (t < T) {
             float l = li[gr], inv = (l>0.f) ? 1.f/l : 0.f;
             #pragma unroll
-            for (int d=0; d<HS; d++)
+            for (int d = 0; d < HS; d++)
                 O[bh + t*NH*HS + d] = __float2half(O_sc[gr*HS + d] * inv);
             if (stats) stats[b*NH*T + h*T + t] = (l>0.f) ? (mi[gr] + logf(l)) : -1e30f;
         }
     }
 }
 
-template<int HS>
-__global__ __launch_bounds__(NWARPS*WSIZE, 2)
-static void flash_bwd_kernel(const half* __restrict__ Q, const half* __restrict__ K,
-                             const half* __restrict__ V, const half* __restrict__ O,
-                             const half* __restrict__ dO, const float* __restrict__ stats,
-                             half* __restrict__ dQ, half* __restrict__ dK, half* __restrict__ dV,
-                             int T, int NH, int is_causal, float scale) {
-    static_assert(HS % 16 == 0 && HS <= BN && HS % 8 == 0, "");
-    constexpr int HT = HS/16, NT = BN/16;
-
+// Flash attention backward kernel
+__global__ static void flash_bwd_kernel(const half* __restrict__ Q, const half* __restrict__ K,
+                                        const half* __restrict__ V, const half* __restrict__ O,
+                                        const half* __restrict__ dO, const float* __restrict__ stats,
+                                        half* __restrict__ dQ, half* __restrict__ dK, half* __restrict__ dV,
+                                        int T, int NH, int is_causal, float scale) {
     const int b = blockIdx.z, h = blockIdx.y, mb = blockIdx.x;
     const int m_start = mb*BM;
     if (m_start >= T) return;
@@ -183,21 +182,27 @@ static void flash_bwd_kernel(const half* __restrict__ Q, const half* __restrict_
     float* Di  = Sf + BM*BN;
     float* Li  = Di + BM;
 
-    load_tile<BM, HS>(Qs,  Q  + bh, m_start, T, NH);
-    load_tile<BM, HS>(dOs, dO + bh, m_start, T, NH);
+    __shared__ float dV_sc[BM*HS];
+    __shared__ float dK_sc[BM*HS];
+    __shared__ float dQ_sc[BM*HS];
+
+    load_tile(Qs,  Q  + bh, m_start, T, NH);
+    load_tile(dOs, dO + bh, m_start, T, NH);
     if (tid < BM) {
         int t = m_start + tid;
         Li[tid] = (t<T) ? lse[t] : -1e30f;
         Di[tid] = 0.f;
     }
     __syncthreads();
+
+    // D[i] = sum_d O[i,d] * dO[i,d]
     if (lane < RPW) {
         int gr = warp*RPW + lane;
         float s = 0.f;
         int t = m_start + gr;
         if (t < T) {
             #pragma unroll
-            for (int d=0; d<HS; d++) {
+            for (int d = 0; d < HS; d++) {
                 float oo = __half2float(O [bh + t*NH*HS + d]);
                 float dd = __half2float(dO[bh + t*NH*HS + d]);
                 s += oo * dd;
@@ -209,38 +214,40 @@ static void flash_bwd_kernel(const half* __restrict__ Q, const half* __restrict_
 
     wmma::fragment<wmma::accumulator,16,16,16,float> dQ_frag[HT];
     #pragma unroll
-    for (int k=0;k<HT;k++) wmma::fill_fragment(dQ_frag[k], 0.f);
+    for (int k = 0; k < HT; k++) wmma::fill_fragment(dQ_frag[k], 0.f);
 
     const int n_end = is_causal ? min(T, m_start+BM) : T;
     for (int n_start = 0; n_start < n_end; n_start += BN) {
-        load_tile<BN, HS>(Ks, K + bh, n_start, T, NH);
-        load_tile<BN, HS>(Vs, V + bh, n_start, T, NH);
+        load_tile(Ks, K + bh, n_start, T, NH);
+        load_tile(Vs, V + bh, n_start, T, NH);
         __syncthreads();
 
+        // S = Q K^T
         wmma::fragment<wmma::accumulator,16,16,16,float> S_frag[NT];
         #pragma unroll
-        for (int j=0;j<NT;j++) wmma::fill_fragment(S_frag[j], 0.f);
+        for (int j = 0; j < NT; j++) wmma::fill_fragment(S_frag[j], 0.f);
         #pragma unroll
-        for (int k=0;k<HT;k++) {
+        for (int k = 0; k < HT; k++) {
             wmma::fragment<wmma::matrix_a,16,16,16,half,wmma::row_major> a;
             wmma::load_matrix_sync(a, Qs + warp*RPW*HS + k*16, HS);
             #pragma unroll
-            for (int j=0;j<NT;j++) {
+            for (int j = 0; j < NT; j++) {
                 wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::col_major> bf;
                 wmma::load_matrix_sync(bf, Ks + j*16*HS + k*16, HS);
                 wmma::mma_sync(S_frag[j], a, bf, S_frag[j]);
             }
         }
         #pragma unroll
-        for (int j=0;j<NT;j++)
+        for (int j = 0; j < NT; j++)
             wmma::store_matrix_sync(Sf + warp*RPW*BN + j*16, S_frag[j], BN, wmma::mem_row_major);
         __syncwarp();
 
+        // Recompute P = softmax(S * scale - LSE)
         if (lane < RPW) {
             int gr = warp*RPW + lane, t_q = m_start + gr;
             float L = Li[gr];
             #pragma unroll
-            for (int c=0;c<BN;c++) {
+            for (int c = 0; c < BN; c++) {
                 int t_k = n_start + c;
                 bool ok = (t_k<T) & (t_q<T) & (!is_causal | (t_k<=t_q));
                 float p = ok ? expf(Sf[gr*BN+c]*scale - L) : 0.f;
@@ -249,57 +256,57 @@ static void flash_bwd_kernel(const half* __restrict__ Q, const half* __restrict_
         }
         __syncthreads();
 
-        {
-            wmma::fragment<wmma::accumulator,16,16,16,float> dV_frag[HT];
+        // dV += P^T dO  (atomic accumulation into global dV)
+        wmma::fragment<wmma::accumulator,16,16,16,float> dV_frag[HT];
+        #pragma unroll
+        for (int k = 0; k < HT; k++) wmma::fill_fragment(dV_frag[k], 0.f);
+        #pragma unroll
+        for (int k = 0; k < (BM/16); k++) {
+            wmma::fragment<wmma::matrix_a,16,16,16,half,wmma::col_major> a;
+            wmma::load_matrix_sync(a, Ps + k*16*BN + warp*RPW, BN);
             #pragma unroll
-            for (int k=0;k<HT;k++) wmma::fill_fragment(dV_frag[k], 0.f);
-            #pragma unroll
-            for (int k=0;k<(BM/16);k++) {
-                wmma::fragment<wmma::matrix_a,16,16,16,half,wmma::col_major> a;
-                wmma::load_matrix_sync(a, Ps + k*16*BN + warp*RPW, BN);
-                #pragma unroll
-                for (int j=0;j<HT;j++) {
-                    wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::row_major> bf;
-                    wmma::load_matrix_sync(bf, dOs + k*16*HS + j*16, HS);
-                    wmma::mma_sync(dV_frag[j], a, bf, dV_frag[j]);
-                }
+            for (int j = 0; j < HT; j++) {
+                wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::row_major> bf;
+                wmma::load_matrix_sync(bf, dOs + k*16*HS + j*16, HS);
+                wmma::mma_sync(dV_frag[j], a, bf, dV_frag[j]);
             }
-            __shared__ float dV_sc[BM*HS];
-            #pragma unroll
-            for (int j=0;j<HT;j++)
-                wmma::store_matrix_sync(dV_sc + warp*16*HS + j*16, dV_frag[j], HS, wmma::mem_row_major);
-            __syncwarp();
-            for (int i = lane; i < 16*HS; i += WSIZE) {
-                int r = i/HS, d = i%HS, t_k = n_start + warp*16 + r;
-                if (t_k < T) atomicAdd((half*)&dV[bh + t_k*NH*HS + d], __float2half(dV_sc[warp*16*HS + i]));
-            }
+        }
+        #pragma unroll
+        for (int j = 0; j < HT; j++)
+            wmma::store_matrix_sync(dV_sc + warp*16*HS + j*16, dV_frag[j], HS, wmma::mem_row_major);
+        __syncwarp();
+        for (int i = lane; i < 16*HS; i += WSIZE) {
+            int r = i/HS, d = i%HS, t_k = n_start + warp*16 + r;
+            if (t_k < T) atomicAdd((half*)&dV[bh + t_k*NH*HS + d], __float2half(dV_sc[warp*16*HS + i]));
         }
         __syncthreads();
 
+        // dP = dO V^T
         wmma::fragment<wmma::accumulator,16,16,16,float> dP_frag[NT];
         #pragma unroll
-        for (int j=0;j<NT;j++) wmma::fill_fragment(dP_frag[j], 0.f);
+        for (int j = 0; j < NT; j++) wmma::fill_fragment(dP_frag[j], 0.f);
         #pragma unroll
-        for (int k=0;k<HT;k++) {
+        for (int k = 0; k < HT; k++) {
             wmma::fragment<wmma::matrix_a,16,16,16,half,wmma::row_major> a;
             wmma::load_matrix_sync(a, dOs + warp*RPW*HS + k*16, HS);
             #pragma unroll
-            for (int j=0;j<NT;j++) {
+            for (int j = 0; j < NT; j++) {
                 wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::col_major> bf;
                 wmma::load_matrix_sync(bf, Vs + j*16*HS + k*16, HS);
                 wmma::mma_sync(dP_frag[j], a, bf, dP_frag[j]);
             }
         }
         #pragma unroll
-        for (int j=0;j<NT;j++)
+        for (int j = 0; j < NT; j++)
             wmma::store_matrix_sync(Sf + warp*RPW*BN + j*16, dP_frag[j], BN, wmma::mem_row_major);
         __syncwarp();
 
+        // dS = P * (dP - D)
         if (lane < RPW) {
             int gr = warp*RPW + lane, t_q = m_start + gr;
             float D = Di[gr];
             #pragma unroll
-            for (int c=0;c<BN;c++) {
+            for (int c = 0; c < BN; c++) {
                 int t_k = n_start + c;
                 bool ok = (t_k<T) & (t_q<T) & (!is_causal | (t_k<=t_q));
                 float p = __half2float(Ps[gr*BN+c]);
@@ -309,110 +316,86 @@ static void flash_bwd_kernel(const half* __restrict__ Q, const half* __restrict_
         }
         __syncthreads();
 
+        // dQ += dS K  (accumulated across n tiles in registers)
         #pragma unroll
-        for (int k=0;k<NT;k++) {
+        for (int k = 0; k < NT; k++) {
             wmma::fragment<wmma::matrix_a,16,16,16,half,wmma::row_major> a;
             wmma::load_matrix_sync(a, dSs + warp*RPW*BN + k*16, BN);
             #pragma unroll
-            for (int j=0;j<HT;j++) {
+            for (int j = 0; j < HT; j++) {
                 wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::row_major> bf;
                 wmma::load_matrix_sync(bf, Ks + k*16*HS + j*16, HS);
                 wmma::mma_sync(dQ_frag[j], a, bf, dQ_frag[j]);
             }
         }
 
-        {
-            wmma::fragment<wmma::accumulator,16,16,16,float> dK_frag[HT];
+        // dK += dS^T Q * scale  (atomic accumulation into global dK)
+        wmma::fragment<wmma::accumulator,16,16,16,float> dK_frag[HT];
+        #pragma unroll
+        for (int k = 0; k < HT; k++) wmma::fill_fragment(dK_frag[k], 0.f);
+        #pragma unroll
+        for (int k = 0; k < (BM/16); k++) {
+            wmma::fragment<wmma::matrix_a,16,16,16,half,wmma::col_major> a;
+            wmma::load_matrix_sync(a, dSs + k*16*BN + warp*RPW, BN);
             #pragma unroll
-            for (int k=0;k<HT;k++) wmma::fill_fragment(dK_frag[k], 0.f);
-            #pragma unroll
-            for (int k=0;k<(BM/16);k++) {
-                wmma::fragment<wmma::matrix_a,16,16,16,half,wmma::col_major> a;
-                wmma::load_matrix_sync(a, dSs + k*16*BN + warp*RPW, BN);
-                #pragma unroll
-                for (int j=0;j<HT;j++) {
-                    wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::row_major> bf;
-                    wmma::load_matrix_sync(bf, Qs + k*16*HS + j*16, HS);
-                    wmma::mma_sync(dK_frag[j], a, bf, dK_frag[j]);
-                }
+            for (int j = 0; j < HT; j++) {
+                wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::row_major> bf;
+                wmma::load_matrix_sync(bf, Qs + k*16*HS + j*16, HS);
+                wmma::mma_sync(dK_frag[j], a, bf, dK_frag[j]);
             }
-            __shared__ float dK_sc[BM*HS];
-            #pragma unroll
-            for (int j=0;j<HT;j++)
-                wmma::store_matrix_sync(dK_sc + warp*16*HS + j*16, dK_frag[j], HS, wmma::mem_row_major);
-            __syncwarp();
-            for (int i = lane; i < 16*HS; i += WSIZE) {
-                int r = i/HS, d = i%HS, t_k = n_start + warp*16 + r;
-                if (t_k < T) atomicAdd((half*)&dK[bh + t_k*NH*HS + d], __float2half(dK_sc[warp*16*HS + i] * scale));
-            }
+        }
+        #pragma unroll
+        for (int j = 0; j < HT; j++)
+            wmma::store_matrix_sync(dK_sc + warp*16*HS + j*16, dK_frag[j], HS, wmma::mem_row_major);
+        __syncwarp();
+        for (int i = lane; i < 16*HS; i += WSIZE) {
+            int r = i/HS, d = i%HS, t_k = n_start + warp*16 + r;
+            if (t_k < T) atomicAdd((half*)&dK[bh + t_k*NH*HS + d], __float2half(dK_sc[warp*16*HS + i] * scale));
         }
         __syncthreads();
     }
 
-    __shared__ float dQ_sc[BM*HS];
+    // Write dQ * scale
     #pragma unroll
-    for (int k=0;k<HT;k++)
+    for (int k = 0; k < HT; k++)
         wmma::store_matrix_sync(dQ_sc + warp*RPW*HS + k*16, dQ_frag[k], HS, wmma::mem_row_major);
     __syncwarp();
     if (lane < RPW) {
         int gr = warp*RPW + lane, t = m_start + gr;
         if (t < T) {
             #pragma unroll
-            for (int d=0; d<HS; d++)
+            for (int d = 0; d < HS; d++)
                 dQ[bh + t*NH*HS + d] = __float2half(dQ_sc[gr*HS + d] * scale);
         }
     }
 }
 
-template<int HS> static inline size_t fwd_smem() {
-    return BM*HS*sizeof(half) + 2*BN*HS*sizeof(half) + BM*BN*sizeof(half)
-         + BM*BN*sizeof(float) + 3*BM*sizeof(float);
-}
-template<int HS> static inline size_t bwd_smem() {
-    return 2*BM*HS*sizeof(half) + 2*BN*HS*sizeof(half) + 2*BM*BN*sizeof(half)
-         + BM*BN*sizeof(float) + 2*BM*sizeof(float);
-}
-
-#define LAUNCH_FWD(HS_VAL) do { \
-    size_t sm = fwd_smem<HS_VAL>(); \
-    cudaFuncSetAttribute(flash_fwd_kernel<HS_VAL>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm); \
-    flash_fwd_kernel<HS_VAL><<<grid, NWARPS*WSIZE, sm>>>(Q,K,V,O,stats,T,NH,is_causal,scale); \
-} while(0)
-
-#define LAUNCH_BWD(HS_VAL) do { \
-    size_t sm = bwd_smem<HS_VAL>(); \
-    cudaFuncSetAttribute(flash_bwd_kernel<HS_VAL>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm); \
-    flash_bwd_kernel<HS_VAL><<<grid, NWARPS*WSIZE, sm>>>(Q,K,V,O,dO,stats,dQ,dK,dV,T,NH,is_causal,scale); \
-} while(0)
-
+// Launch flash attention forward
 static void flash_attention_forward(const half* Q, const half* K, const half* V, half* O, float* stats,
-                                     int B, int NH, int T, int HS, int is_causal) {
+                                    int B, int NH, int T, int head_dim, int is_causal) {
+    if (head_dim != HS) { fprintf(stderr, "flash attn: head_dim=%d not supported (compiled for %d)\n", head_dim, HS); exit(1); }
     float scale = 1.0f / sqrtf((float)HS);
+    size_t smem = BM*HS*sizeof(half) + 2*BN*HS*sizeof(half) + BM*BN*sizeof(half)
+                + BM*BN*sizeof(float) + 3*BM*sizeof(float);
+    cudaFuncSetAttribute(flash_fwd_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
     dim3 grid((T + BM - 1) / BM, NH, B);
-    switch (HS) {
-        case 16:  LAUNCH_FWD(16);  break;
-        case 32:  LAUNCH_FWD(32);  break;
-        case 48:  LAUNCH_FWD(48);  break;
-        case 64:  LAUNCH_FWD(64);  break;
-        default:  fprintf(stderr, "flash attn: unsupported HS=%d\n", HS); exit(1);
-    }
+    flash_fwd_kernel<<<grid, NWARPS*WSIZE, smem>>>(Q, K, V, O, stats, T, NH, is_causal, scale);
 }
 
+// Launch flash attention backward
 static void flash_attention_backward(const half* Q, const half* K, const half* V, const half* O,
-                                      const half* dO, const float* stats,
-                                      half* dQ, half* dK, half* dV,
-                                      int B, int NH, int T, int HS, int is_causal) {
+                                     const half* dO, const float* stats,
+                                     half* dQ, half* dK, half* dV,
+                                     int B, int NH, int T, int head_dim, int is_causal) {
+    if (head_dim != HS) { fprintf(stderr, "flash attn: head_dim=%d not supported (compiled for %d)\n", head_dim, HS); exit(1); }
     float scale = 1.0f / sqrtf((float)HS);
+    size_t smem = 2*BM*HS*sizeof(half) + 2*BN*HS*sizeof(half) + 2*BM*BN*sizeof(half)
+                + BM*BN*sizeof(float) + 2*BM*sizeof(float);
     CHECK_CUDA(cudaMemsetAsync(dK, 0, (size_t)B*NH*T*HS*sizeof(half)));
     CHECK_CUDA(cudaMemsetAsync(dV, 0, (size_t)B*NH*T*HS*sizeof(half)));
+    cudaFuncSetAttribute(flash_bwd_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
     dim3 grid((T + BM - 1) / BM, NH, B);
-    switch (HS) {
-        case 16:  LAUNCH_BWD(16);  break;
-        case 32:  LAUNCH_BWD(32);  break;
-        case 48:  LAUNCH_BWD(48);  break;
-        case 64:  LAUNCH_BWD(64);  break;
-        default:  fprintf(stderr, "flash attn: unsupported HS=%d\n", HS); exit(1);
-    }
+    flash_bwd_kernel<<<grid, NWARPS*WSIZE, smem>>>(Q, K, V, O, dO, stats, dQ, dK, dV, T, NH, is_causal, scale);
 }
 
 // cuBLASLt matrix multiplication macro
