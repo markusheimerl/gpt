@@ -75,7 +75,7 @@ GPT* init_gpt(int seq_len, int d_model, int hidden_dim, int num_layers, int batc
     CHECK_CUDA(cudaMemset(gpt->d_token_embedding_v, 0, token_emb_size * sizeof(float)));
     
     // Initialize transformer
-    gpt->transformer = init_transformer(seq_len, d_model, hidden_dim, num_layers, batch_size, true, true, cublaslt_handle);
+    gpt->transformer = init_transformer(seq_len, d_model, hidden_dim, num_layers, batch_size, cublaslt_handle);
     
     // Create cuBLASLt matrix multiplication descriptor
     CHECK_CUBLASLT(cublasLtMatmulDescCreate(&gpt->matmul_desc, CUBLAS_COMPUTE_32F_FAST_TF32, CUDA_R_32F));

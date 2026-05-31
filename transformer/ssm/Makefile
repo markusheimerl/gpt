@@ -6,13 +6,13 @@ ARCH ?= sm_86
 CUDAFLAGS = --cuda-gpu-arch=$(ARCH) -x cuda
 CUDALIBS = -lcudart -lcublasLt
 
-test.out: attention.o test.o
-	$(CC) attention.o test.o $(CUDALIBS) $(LDFLAGS) -o $@
+test.out: ssm.o test.o
+	$(CC) ssm.o test.o $(CUDALIBS) $(LDFLAGS) -o $@
 
-attention.o: attention.c attention.h
-	$(CC) $(CFLAGS) $(CUDAFLAGS) -c attention.c -o $@
+ssm.o: ssm.c ssm.h
+	$(CC) $(CFLAGS) $(CUDAFLAGS) -c ssm.c -o $@
 
-test.o: test.c attention.h
+test.o: test.c ssm.h
 	$(CC) $(CFLAGS) $(CUDAFLAGS) -c test.c -o $@
 
 run: test.out

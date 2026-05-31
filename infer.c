@@ -10,7 +10,7 @@
 extern void openblas_set_num_threads(int);
 
 // ============================================================================
-// Model structures
+// Model structures (CPU, fp32)
 // ============================================================================
 
 typedef struct {
@@ -20,28 +20,26 @@ typedef struct {
 } MLP;
 
 typedef struct {
-    float *W_q, *W_k, *W_v, *W_o;
-    float *q, *k, *v, *z, *out;
-    float *scores, *probs;
-    float *K_cache;   /* [seq_len x d_model] */
-    float *V_cache;   /* [seq_len x d_model] */
-    int seq_len, d_model, num_heads, head_dim;
-    float scale;
-    bool is_causal, use_rope;
-} Attention;
+    float *W_in, *W_out;     // [d_model x d_model]
+    float *A, *B, *C;        // [d_model x state_dim]; A pre-sigmoid
+    float *D;                // [d_model]
+    float *state;            // [d_model x state_dim]   per-channel running state
+    float *u, *z, *out;      // workspace
+    int d_model, state_dim;
+} SSM;
 
 typedef struct {
-    Attention** attn;
-    MLP**       mlp;
+    SSM** ssm;
+    MLP** mlp;
     float *norm1, *norm2;
     int num_layers, d_model;
 } Transformer;
 
 typedef struct {
-    float* token_embedding;   /* [vocab_size x d_model] */
+    float* token_embedding;
     Transformer* transformer;
     float *x, *final_norm;
-    float* logits;            /* [vocab_size] */
+    float* logits;
     int seq_len, d_model, hidden_dim, num_layers, vocab_size;
 } GPT;
 
@@ -67,15 +65,13 @@ static void mlp_free(MLP* m) {
 }
 
 static void mlp_forward(MLP* m, float* x) {
-    cblas_sgemv(CblasRowMajor, CblasTrans,
-                m->input_dim, m->hidden_dim,
+    cblas_sgemv(CblasRowMajor, CblasTrans, m->input_dim, m->hidden_dim,
                 1.0f, m->W1, m->hidden_dim, x, 1, 0.0f, m->h, 1);
     for (int i = 0; i < m->hidden_dim; i++) {
         float h = m->h[i];
-        m->s[i] = h / (1.0f + expf(-h));   /* swish */
+        m->s[i] = h / (1.0f + expf(-h));
     }
-    cblas_sgemv(CblasRowMajor, CblasTrans,
-                m->hidden_dim, m->output_dim,
+    cblas_sgemv(CblasRowMajor, CblasTrans, m->hidden_dim, m->output_dim,
                 1.0f, m->W2, m->output_dim, m->s, 1, 0.0f, m->out, 1);
 }
 
@@ -89,108 +85,87 @@ static MLP* mlp_deserialize(FILE* f) {
     size_t w2 = (size_t)hid * out_d;
     fread(m->W1, sizeof(float), w1, f);
     fread(m->W2, sizeof(float), w2, f);
-    /* skip optimizer state: t (int) + m,v for W1 and W2 */
     int t; fread(&t, sizeof(int), 1, f);
     fseek(f, (long)((2 * w1 + 2 * w2) * sizeof(float)), SEEK_CUR);
     return m;
 }
 
 // ============================================================================
-// Attention (with KV-cache for autoregressive decoding)
+// SSM (per-token incremental)
 // ============================================================================
 
-static Attention* attn_alloc(int seq_len, int d_model, int num_heads,
-                             bool is_causal, bool use_rope) {
-    Attention* a = malloc(sizeof(Attention));
-    a->seq_len = seq_len; a->d_model = d_model;
-    a->num_heads = num_heads; a->head_dim = d_model / num_heads;
-    a->scale = 1.0f / sqrtf((float)a->head_dim);
-    a->is_causal = is_causal; a->use_rope = use_rope;
-    size_t w = (size_t)d_model * d_model;
-    a->W_q = malloc(w * sizeof(float)); a->W_k = malloc(w * sizeof(float));
-    a->W_v = malloc(w * sizeof(float)); a->W_o = malloc(w * sizeof(float));
-    a->q   = malloc(d_model * sizeof(float)); a->k = malloc(d_model * sizeof(float));
-    a->v   = malloc(d_model * sizeof(float)); a->z = malloc(d_model * sizeof(float));
-    a->out = malloc(d_model * sizeof(float));
-    a->scores = malloc(seq_len * sizeof(float));
-    a->probs  = malloc(seq_len * sizeof(float));
-    a->K_cache = malloc((size_t)seq_len * d_model * sizeof(float));
-    a->V_cache = malloc((size_t)seq_len * d_model * sizeof(float));
-    return a;
+static SSM* ssm_alloc(int d_model, int state_dim) {
+    SSM* s = malloc(sizeof(SSM));
+    s->d_model = d_model; s->state_dim = state_dim;
+    size_t ws = (size_t)d_model * d_model;
+    size_t ss = (size_t)d_model * state_dim;
+    s->W_in  = malloc(ws * sizeof(float));
+    s->W_out = malloc(ws * sizeof(float));
+    s->A     = malloc(ss * sizeof(float));
+    s->B     = malloc(ss * sizeof(float));
+    s->C     = malloc(ss * sizeof(float));
+    s->D     = malloc(d_model * sizeof(float));
+    s->state = calloc(ss, sizeof(float));
+    s->u   = malloc(d_model * sizeof(float));
+    s->z   = malloc(d_model * sizeof(float));
+    s->out = malloc(d_model * sizeof(float));
+    return s;
 }
 
-static void attn_free(Attention* a) {
-    free(a->W_q); free(a->W_k); free(a->W_v); free(a->W_o);
-    free(a->q); free(a->k); free(a->v); free(a->z); free(a->out);
-    free(a->scores); free(a->probs);
-    free(a->K_cache); free(a->V_cache);
-    free(a);
+static void ssm_free(SSM* s) {
+    free(s->W_in); free(s->W_out);
+    free(s->A); free(s->B); free(s->C); free(s->D);
+    free(s->state);
+    free(s->u); free(s->z); free(s->out);
+    free(s);
 }
 
-static void rope_apply(float* q, float* k, int pos, int d_model) {
-    for (int dp = 0; dp < d_model / 2; dp++) {
-        int d = dp * 2;
-        float theta = powf(10000.0f, -((float)d / (float)d_model));
-        float angle = (float)pos * theta;
-        float ca = cosf(angle), sa = sinf(angle);
-        float q0 = q[d], q1 = q[d+1];
-        q[d]   = q0*ca - q1*sa;  q[d+1] = q0*sa + q1*ca;
-        float k0 = k[d], k1 = k[d+1];
-        k[d]   = k0*ca - k1*sa;  k[d+1] = k0*sa + k1*ca;
-    }
-}
+// One token step. Mirrors the GPU forward kernel exactly.
+static void ssm_forward(SSM* s, float* x) {
+    int d = s->d_model, N = s->state_dim;
 
-static void attn_forward(Attention* a, float* x, int pos) {
-    int d = a->d_model, hd = a->head_dim, nh = a->num_heads;
+    cblas_sgemv(CblasRowMajor, CblasTrans, d, d,
+                1.0f, s->W_in, d, x, 1, 0.0f, s->u, 1);
 
-    cblas_sgemv(CblasRowMajor, CblasTrans, d, d, 1.0f, a->W_q, d, x, 1, 0.0f, a->q, 1);
-    cblas_sgemv(CblasRowMajor, CblasTrans, d, d, 1.0f, a->W_k, d, x, 1, 0.0f, a->k, 1);
-    cblas_sgemv(CblasRowMajor, CblasTrans, d, d, 1.0f, a->W_v, d, x, 1, 0.0f, a->v, 1);
-
-    if (a->use_rope) rope_apply(a->q, a->k, pos, d);
-
-    memcpy(a->K_cache + (size_t)pos * d, a->k, d * sizeof(float));
-    memcpy(a->V_cache + (size_t)pos * d, a->v, d * sizeof(float));
-
-    memset(a->z, 0, d * sizeof(float));
-    for (int h = 0; h < nh; h++) {
-        float* q_h = a->q + h * hd;
-        float* z_h = a->z + h * hd;
-        float max_s = -1e30f;
-        for (int j = 0; j <= pos; j++) {
-            float s = cblas_sdot(hd, q_h, 1, a->K_cache + (size_t)j*d + h*hd, 1) * a->scale;
-            a->scores[j] = s;
-            if (s > max_s) max_s = s;
+    for (int dd = 0; dd < d; dd++) {
+        float u = s->u[dd];
+        float acc = 0.0f;
+        float* st = &s->state[dd * N];
+        for (int n = 0; n < N; n++) {
+            float a_raw = s->A[dd * N + n];
+            float a = 1.0f / (1.0f + expf(-a_raw));
+            float new_s = a * st[n] + s->B[dd * N + n] * u;
+            st[n] = new_s;
+            acc += s->C[dd * N + n] * new_s;
         }
-        float sum = 0.0f;
-        for (int j = 0; j <= pos; j++) {
-            a->probs[j] = expf(a->scores[j] - max_s);
-            sum += a->probs[j];
-        }
-        float inv = 1.0f / sum;
-        for (int j = 0; j <= pos; j++)
-            cblas_saxpy(hd, a->probs[j] * inv,
-                        a->V_cache + (size_t)j*d + h*hd, 1, z_h, 1);
+        s->z[dd] = acc + s->D[dd] * u;
     }
-    cblas_sgemv(CblasRowMajor, CblasTrans, d, d, 1.0f, a->W_o, d, a->z, 1, 0.0f, a->out, 1);
+
+    cblas_sgemv(CblasRowMajor, CblasTrans, d, d,
+                1.0f, s->W_out, d, s->z, 1, 0.0f, s->out, 1);
 }
 
-static Attention* attn_deserialize(FILE* f, int seq_len) {
-    int d_model;
-    bool is_causal, use_rope;
-    fread(&d_model,   sizeof(int),  1, f);
-    fread(&is_causal, sizeof(bool), 1, f);
-    fread(&use_rope,  sizeof(bool), 1, f);
-    Attention* a = attn_alloc(seq_len, d_model, 8, is_causal, use_rope);
-    size_t w = (size_t)d_model * d_model;
-    fread(a->W_q, sizeof(float), w, f);
-    fread(a->W_k, sizeof(float), w, f);
-    fread(a->W_v, sizeof(float), w, f);
-    fread(a->W_o, sizeof(float), w, f);
-    /* skip optimizer state: t (int) + m,v for each of W_q, W_k, W_v, W_o */
+static SSM* ssm_deserialize(FILE* f) {
+    int d_model, state_dim;
+    fread(&d_model,   sizeof(int), 1, f);
+    fread(&state_dim, sizeof(int), 1, f);
+    SSM* s = ssm_alloc(d_model, state_dim);
+
+    size_t ws = (size_t)d_model * d_model;
+    size_t ss = (size_t)d_model * state_dim;
+
+    fread(s->W_in,  sizeof(float), ws,      f);
+    fread(s->W_out, sizeof(float), ws,      f);
+    fread(s->A,     sizeof(float), ss,      f);
+    fread(s->B,     sizeof(float), ss,      f);
+    fread(s->C,     sizeof(float), ss,      f);
+    fread(s->D,     sizeof(float), d_model, f);
+
+    // Skip optimizer state: t + (m,v) for each of {W_in,W_out,A,B,C,D}
     int t; fread(&t, sizeof(int), 1, f);
-    fseek(f, (long)(8 * w * sizeof(float)), SEEK_CUR);
-    return a;
+    long skip = (long)((2 * ws + 2 * ws + 2 * ss + 2 * ss + 2 * ss + 2 * (size_t)d_model) * sizeof(float));
+    fseek(f, skip, SEEK_CUR);
+    return s;
 }
 
 // ============================================================================
@@ -207,7 +182,7 @@ static void rmsnorm(float* out, const float* in, int d) {
 static Transformer* transformer_alloc(int d_model, int num_layers) {
     Transformer* t = malloc(sizeof(Transformer));
     t->d_model = d_model; t->num_layers = num_layers;
-    t->attn  = malloc(num_layers * sizeof(Attention*));
+    t->ssm   = malloc(num_layers * sizeof(SSM*));
     t->mlp   = malloc(num_layers * sizeof(MLP*));
     t->norm1 = malloc(d_model * sizeof(float));
     t->norm2 = malloc(d_model * sizeof(float));
@@ -216,20 +191,20 @@ static Transformer* transformer_alloc(int d_model, int num_layers) {
 
 static void transformer_free(Transformer* t) {
     for (int i = 0; i < t->num_layers; i++) {
-        attn_free(t->attn[i]);
+        ssm_free(t->ssm[i]);
         mlp_free(t->mlp[i]);
     }
-    free(t->attn); free(t->mlp);
+    free(t->ssm); free(t->mlp);
     free(t->norm1); free(t->norm2);
     free(t);
 }
 
-static void transformer_forward(Transformer* t, float* x, int pos) {
+static void transformer_forward(Transformer* t, float* x) {
     int d = t->d_model;
     for (int l = 0; l < t->num_layers; l++) {
         rmsnorm(t->norm1, x, d);
-        attn_forward(t->attn[l], t->norm1, pos);
-        for (int i = 0; i < d; i++) x[i] += t->attn[l]->out[i];
+        ssm_forward(t->ssm[l], t->norm1);
+        for (int i = 0; i < d; i++) x[i] += t->ssm[l]->out[i];
 
         rmsnorm(t->norm2, x, d);
         mlp_forward(t->mlp[l], t->norm2);
@@ -237,19 +212,16 @@ static void transformer_forward(Transformer* t, float* x, int pos) {
     }
 }
 
-static Transformer* transformer_deserialize(FILE* f, int seq_len) {
+static Transformer* transformer_deserialize(FILE* f) {
     int d_model, hidden_dim, num_layers;
-    bool is_causal, use_rope;
-    fread(&d_model,    sizeof(int),  1, f);
-    fread(&hidden_dim, sizeof(int),  1, f);
-    fread(&num_layers, sizeof(int),  1, f);
-    fread(&is_causal,  sizeof(bool), 1, f);
-    fread(&use_rope,   sizeof(bool), 1, f);
-    (void)hidden_dim; (void)is_causal; (void)use_rope;
+    fread(&d_model,    sizeof(int), 1, f);
+    fread(&hidden_dim, sizeof(int), 1, f);
+    fread(&num_layers, sizeof(int), 1, f);
+    (void)hidden_dim;
     Transformer* t = transformer_alloc(d_model, num_layers);
     for (int i = 0; i < num_layers; i++) {
-        t->attn[i] = attn_deserialize(f, seq_len);
-        t->mlp[i]  = mlp_deserialize(f);
+        t->ssm[i] = ssm_deserialize(f);
+        t->mlp[i] = mlp_deserialize(f);
     }
     return t;
 }
@@ -258,12 +230,11 @@ static Transformer* transformer_deserialize(FILE* f, int seq_len) {
 // GPT
 // ============================================================================
 
-static void gpt_forward(GPT* gpt, unsigned char token, int pos) {
+static void gpt_forward(GPT* gpt, unsigned char token) {
     int d = gpt->d_model;
     memcpy(gpt->x, gpt->token_embedding + (size_t)token * d, d * sizeof(float));
-    transformer_forward(gpt->transformer, gpt->x, pos);
+    transformer_forward(gpt->transformer, gpt->x);
     rmsnorm(gpt->final_norm, gpt->x, d);
-    /* logits = token_embedding * final_norm   (weight-tied output) */
     cblas_sgemv(CblasRowMajor, CblasNoTrans,
                 gpt->vocab_size, d,
                 1.0f, gpt->token_embedding, d,
@@ -293,15 +264,15 @@ static GPT* gpt_load(const char* path, int seq_len) {
 
     fread(gpt->token_embedding, sizeof(float), emb, f);
 
-    /* skip optimizer state: t (int) + m,v for token_embedding */
     int t; fread(&t, sizeof(int), 1, f);
     fseek(f, (long)(2 * emb * sizeof(float)), SEEK_CUR);
 
-    gpt->transformer = transformer_deserialize(f, seq_len);
+    gpt->transformer = transformer_deserialize(f);
     fclose(f);
 
-    fprintf(stderr, "Loaded: d_model=%d  hidden=%d  layers=%d  vocab=%d  seq_len=%d\n",
-            d_model, hidden_dim, num_layers, vocab_size, seq_len);
+    fprintf(stderr, "Loaded: d_model=%d hidden=%d layers=%d vocab=%d state_dim=%d\n",
+            d_model, hidden_dim, num_layers, vocab_size,
+            gpt->transformer->ssm[0]->state_dim);
     return gpt;
 }
 
@@ -384,25 +355,21 @@ int main(int argc, char* argv[]) {
     if (!g_gpt) return 1;
 
     int prompt_len = (int)strlen(prompt);
-    if (prompt_len >= seq_len) { fprintf(stderr, "Prompt too long\n"); return 1; }
-    if (n_tokens > seq_len - prompt_len) n_tokens = seq_len - prompt_len;
 
     fprintf(stderr, "Generating %d tokens (T=%.2f, seed=%u)\n",
             n_tokens, temperature, seed);
 
-    /* Feed prompt */
     for (int pos = 0; pos < prompt_len; pos++) {
-        gpt_forward(g_gpt, (unsigned char)prompt[pos], pos);
+        gpt_forward(g_gpt, (unsigned char)prompt[pos]);
         fputc(prompt[pos], stdout);
     }
     fflush(stdout);
 
-    /* Sample */
-    for (int pos = prompt_len; pos < prompt_len + n_tokens; pos++) {
+    for (int i = 0; i < n_tokens; i++) {
         unsigned char next = sample(g_gpt->logits, g_gpt->vocab_size, temperature);
         fputc((char)next, stdout);
         fflush(stdout);
-        gpt_forward(g_gpt, next, pos);
+        gpt_forward(g_gpt, next);
     }
     fputc('\n', stdout);
 

@@ -6,41 +6,35 @@ ARCH ?= sm_86
 CUDAFLAGS = --cuda-gpu-arch=$(ARCH) -x cuda
 CUDALIBS = -lcudart -lcublasLt
 
-train.out: gpt.o transformer/transformer.o transformer/attention/attention.o transformer/mlp/mlp.o train.o
-	$(CC) gpt.o transformer/transformer.o transformer/attention/attention.o transformer/mlp/mlp.o train.o $(CUDALIBS) $(LDFLAGS) -o $@
+train.out: gpt.o transformer/transformer.o transformer/ssm/ssm.o transformer/mlp/mlp.o train.o
+	$(CC) gpt.o transformer/transformer.o transformer/ssm/ssm.o transformer/mlp/mlp.o train.o $(CUDALIBS) $(LDFLAGS) -o $@
+
+infer.out: infer.c
+	$(CC) $(CFLAGS) infer.c $(LDFLAGS) -o $@
 
 gpt.o: gpt.c gpt.h
 	$(CC) $(CFLAGS) $(CUDAFLAGS) -c gpt.c -o $@
 
 transformer/transformer.o:
-	$(MAKE) -C transformer/ transformer.o
+	$(MAKE) -C transformer transformer.o
 
-transformer/attention/attention.o:
-	$(MAKE) -C transformer/attention/ attention.o
+transformer/ssm/ssm.o:
+	$(MAKE) -C transformer/ssm ssm.o
 
 transformer/mlp/mlp.o:
-	$(MAKE) -C transformer/mlp/ mlp.o
+	$(MAKE) -C transformer/mlp mlp.o
 
 train.o: train.c gpt.h
 	$(CC) $(CFLAGS) $(CUDAFLAGS) -c train.c -o $@
 
-infer.out: infer.c
-	$(CC) $(CFLAGS) infer.c $(LDFLAGS) -o $@
-
-data:
-	@test -f corpus.txt || curl -L -o corpus.txt https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/TinyStoriesV2-GPT4-train.txt
-
-run: train.out data
+train: train.out
 	@time ./train.out corpus.txt
 
-cont: train.out data
-	@time ./train.out corpus.txt $$(ls -t *_gpt.bin 2>/dev/null | head -n1)
+run: train
 
 infer: infer.out
-	@./infer.out $$(ls -t *_gpt.bin 2>/dev/null | head -n1) --prompt="Once upon a time, there was a" --temperature=0.7 --tokens=1024
+	@time ./infer.out
 
 clean:
-	rm -f *.out *.o *.csv
+	rm -f *.out *.o *.csv *.bin
 	$(MAKE) -C transformer/ clean
-	$(MAKE) -C transformer/attention/ clean
-	$(MAKE) -C transformer/mlp/ clean

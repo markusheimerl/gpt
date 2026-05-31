@@ -158,8 +158,8 @@ int main(int argc, char* argv[]) {
 
     // Model hyperparameters
     const int seq_len = 1024;
-    const int num_layers = 16;
-    const int batch_size = 15;
+    const int num_layers = 17;
+    const int batch_size = 32;
     const int d_model = num_layers * 32;
     const int hidden_dim = d_model * 2;
     float learning_rate = 0.0001f;
@@ -172,14 +172,22 @@ int main(int argc, char* argv[]) {
         gpt = init_gpt(seq_len, d_model, hidden_dim, num_layers, batch_size, cublaslt_handle);
     }
     
-    printf("Parameters: ~%.1fM\n", (float)(gpt->vocab_size * gpt->d_model + gpt->transformer->num_layers * ((size_t)4 * gpt->d_model * gpt->d_model + gpt->d_model * gpt->transformer->mlp_layers[0]->hidden_dim + gpt->transformer->mlp_layers[0]->hidden_dim * gpt->d_model)) / 1e6f);
+    {
+        size_t d = gpt->d_model;
+        size_t N = gpt->transformer->state_dim;
+        size_t hid = gpt->transformer->mlp_layers[0]->hidden_dim;
+        size_t ssm_per_layer = 2 * d * d + 3 * d * N + d;
+        size_t mlp_per_layer = d * hid + hid * d;
+        printf("Parameters: ~%.1fM\n",
+            (float)(gpt->vocab_size * d + gpt->transformer->num_layers * (ssm_per_layer + mlp_per_layer)) / 1e6f);
+    }
     
     // Create shuffled indices for random sampling without replacement
     size_t total_sequences = (get_file_size(corpus_path) - 1) / seq_len;
     size_t* shuffled_indices = create_shuffled_indices(total_sequences);
     
     // Allocate host buffers for sequences
-    size_t sequences_per_chunk = (4 * 1024 * 1024) / seq_len;
+    size_t sequences_per_chunk = (128 * 1024 * 1024) / seq_len;
     unsigned char* input_tokens = (unsigned char*)malloc(sequences_per_chunk * seq_len * sizeof(unsigned char));
     unsigned char* target_tokens = (unsigned char*)malloc(sequences_per_chunk * seq_len * sizeof(unsigned char));
     
