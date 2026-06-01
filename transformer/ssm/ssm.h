@@ -5,7 +5,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
-#include <stdbool.h>
 #include <cublasLt.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -34,66 +33,61 @@
 } while(0)
 #endif
 
-// Vanilla diagonal state-space model layer.
-//
-//   U = X W_in                                     ([B,L,D])
-//   s_{b,d}[t] = a_d ⊙ s_{b,d}[t-1] + b_d * U[b,t,d]   (per-channel, vector len N)
-//   Z[b,t,d]   = c_d · s_{b,d}[t] + D_d * U[b,t,d]
-//   Y = Z W_out                                    ([B,L,D])
-//
-// Per-channel parameters a_d, b_d, c_d ∈ ℝ^N (state size N). Recurrence
-// coefficient parametrised as a_d = σ(â_d) so values stay in (0,1).
 typedef struct {
-    // Device weights
-    half* d_W_in;     // [d_model x d_model]   input projection
-    half* d_W_out;    // [d_model x d_model]   output projection
-    half* d_A_raw;    // [d_model x state_dim] raw (σ applied at use)
-    half* d_B;        // [d_model x state_dim]
-    half* d_C;        // [d_model x state_dim]
-    half* d_D;        // [d_model]             per-channel skip
+    // Weights and gradients
+    half* d_W_in;       // [d_model x d_model]
+    half* d_W_out;      // [d_model x d_model]
+    half* d_A_raw;      // [d_model x state_dim]   (σ applied at use)
+    half* d_B;          // [d_model x state_dim]
+    half* d_C;          // [d_model x state_dim]
+    half* d_D;          // [d_model]
+    half* d_W_in_grad;  // [d_model x d_model]
+    half* d_W_out_grad; // [d_model x d_model]
+    half* d_A_raw_grad; // [d_model x state_dim]
+    half* d_B_grad;     // [d_model x state_dim]
+    half* d_C_grad;     // [d_model x state_dim]
+    half* d_D_grad;     // [d_model]
 
-    // Device gradients
-    half* d_W_in_grad;
-    half* d_W_out_grad;
-    half* d_A_raw_grad;
-    half* d_B_grad;
-    half* d_C_grad;
-    half* d_D_grad;
+    // Adam parameters
+    float* d_W_in_m;    // First moment for W_in
+    float* d_W_in_v;    // Second moment for W_in
+    float* d_W_out_m;   // First moment for W_out
+    float* d_W_out_v;   // Second moment for W_out
+    float* d_A_raw_m;   // First moment for A_raw
+    float* d_A_raw_v;   // Second moment for A_raw
+    float* d_B_m;       // First moment for B
+    float* d_B_v;       // Second moment for B
+    float* d_C_m;       // First moment for C
+    float* d_C_v;       // Second moment for C
+    float* d_D_m;       // First moment for D
+    float* d_D_v;       // Second moment for D
+    float beta1;        // Exponential decay rate for first moment
+    float beta2;        // Exponential decay rate for second moment
+    float epsilon;      // Small constant for numerical stability
+    int t;              // Time step
+    float weight_decay; // Weight decay parameter for AdamW
 
-    // Adam state (m, v) for every weight tensor
-    float *d_W_in_m,  *d_W_in_v;
-    float *d_W_out_m, *d_W_out_v;
-    float *d_A_raw_m, *d_A_raw_v;
-    float *d_B_m,     *d_B_v;
-    float *d_C_m,     *d_C_v;
-    float *d_D_m,     *d_D_v;
-    float beta1;
-    float beta2;
-    float epsilon;
-    int   t;
-    float weight_decay;
+    // Forward pass buffers
+    half* d_U;       // [batch_size x seq_len x d_model]               input projection
+    half* d_Z;       // [batch_size x seq_len x d_model]               scan output (pre W_out)
+    half* d_output;  // [batch_size x seq_len x d_model]               final output
+    half* d_states;  // [batch_size x seq_len x d_model x state_dim]   saved states
 
-    // Forward-pass buffers
-    half* d_U;        // [B x L x D]               input-projected sequence
-    half* d_Z;        // [B x L x D]               scan output (pre W_out)
-    half* d_output;   // [B x L x D]               final output Y
-    half* d_states;   // [B x L x D x state_dim]   saved states for backward
+    // Backward pass buffers
+    half* d_grad_output;    // [batch_size x seq_len x d_model]
+    half* d_grad_Z;         // [batch_size x seq_len x d_model]
+    half* d_grad_U;         // [batch_size x seq_len x d_model]
 
-    // Backward-pass buffers (aliases of forward buffers)
-    half* d_grad_output;   // alias of d_output
-    half* d_grad_Z;        // alias of d_Z
-    half* d_grad_U;        // alias of d_U
+    // Loss computation buffer
+    float* d_loss_result;   // [1]
 
-    // Loss accumulator
-    float* d_loss_result;
-
-    // cuBLASLt handle and matmul descriptor
+    // cuBLASLt handle and descriptor
     cublasLtHandle_t cublaslt_handle;
     cublasLtMatmulDesc_t matmul_desc;
 
     // Matrix layouts
-    cublasLtMatrixLayout_t weight_layout;     // [D x D]
-    cublasLtMatrixLayout_t seq_flat_layout;   // [B*L x D]
+    cublasLtMatrixLayout_t weight_layout;     // [d_model x d_model]
+    cublasLtMatrixLayout_t seq_flat_layout;   // [batch_size * seq_len x d_model]
 
     // Dimensions
     int seq_len;
