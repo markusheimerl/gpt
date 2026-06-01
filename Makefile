@@ -6,8 +6,8 @@ ARCH ?= sm_86
 CUDAFLAGS = --cuda-gpu-arch=$(ARCH) -x cuda
 CUDALIBS = -lcudart -lcublasLt
 
-train.out: gpt.o transformer/transformer.o transformer/ssm/ssm.o transformer/mlp/mlp.o train.o
-	$(CC) gpt.o transformer/transformer.o transformer/ssm/ssm.o transformer/mlp/mlp.o train.o $(CUDALIBS) $(LDFLAGS) -o $@
+train.out: gpt.o transformer/transformer.o transformer/mingru/mingru.o transformer/mlp/mlp.o train.o
+	$(CC) gpt.o transformer/transformer.o transformer/mingru/mingru.o transformer/mlp/mlp.o train.o $(CUDALIBS) $(LDFLAGS) -o $@
 
 infer.out: infer.c
 	$(CC) $(CFLAGS) infer.c $(LDFLAGS) -o $@
@@ -18,8 +18,8 @@ gpt.o: gpt.c gpt.h
 transformer/transformer.o:
 	$(MAKE) -C transformer transformer.o
 
-transformer/ssm/ssm.o:
-	$(MAKE) -C transformer/ssm ssm.o
+transformer/mingru/mingru.o:
+	$(MAKE) -C transformer/mingru mingru.o
 
 transformer/mlp/mlp.o:
 	$(MAKE) -C transformer/mlp mlp.o

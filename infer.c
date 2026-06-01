@@ -20,16 +20,14 @@ typedef struct {
 } MLP;
 
 typedef struct {
-    float *W_in, *W_out;     // [d_model x d_model]
-    float *A, *B, *C;        // [d_model x state_dim]; A pre-sigmoid
-    float *D;                // [d_model]
-    float *state;            // [d_model x state_dim]   per-channel running state
-    float *u, *z, *out;      // workspace
-    int d_model, state_dim;
-} SSM;
+    float *W_z, *W_h;        // [d_model x d_model]
+    float *state;            // [d_model] running hidden state h
+    float *k, *v, *out;      // workspace
+    int d_model;
+} MinGRU;
 
 typedef struct {
-    SSM** ssm;
+    MinGRU** mixer;
     MLP** mlp;
     float *norm1, *norm2;
     int num_layers, d_model;
@@ -91,81 +89,61 @@ static MLP* mlp_deserialize(FILE* f) {
 }
 
 // ============================================================================
-// SSM (per-token incremental)
+// minGRU (per-token incremental)
 // ============================================================================
 
-static SSM* ssm_alloc(int d_model, int state_dim) {
-    SSM* s = malloc(sizeof(SSM));
-    s->d_model = d_model; s->state_dim = state_dim;
+static MinGRU* mingru_alloc(int d_model) {
+    MinGRU* m = malloc(sizeof(MinGRU));
+    m->d_model = d_model;
     size_t ws = (size_t)d_model * d_model;
-    size_t ss = (size_t)d_model * state_dim;
-    s->W_in  = malloc(ws * sizeof(float));
-    s->W_out = malloc(ws * sizeof(float));
-    s->A     = malloc(ss * sizeof(float));
-    s->B     = malloc(ss * sizeof(float));
-    s->C     = malloc(ss * sizeof(float));
-    s->D     = malloc(d_model * sizeof(float));
-    s->state = calloc(ss, sizeof(float));
-    s->u   = malloc(d_model * sizeof(float));
-    s->z   = malloc(d_model * sizeof(float));
-    s->out = malloc(d_model * sizeof(float));
-    return s;
+    m->W_z   = malloc(ws * sizeof(float));
+    m->W_h   = malloc(ws * sizeof(float));
+    m->state = calloc(d_model, sizeof(float));
+    m->k     = malloc(d_model * sizeof(float));
+    m->v     = malloc(d_model * sizeof(float));
+    m->out   = malloc(d_model * sizeof(float));
+    return m;
 }
 
-static void ssm_free(SSM* s) {
-    free(s->W_in); free(s->W_out);
-    free(s->A); free(s->B); free(s->C); free(s->D);
-    free(s->state);
-    free(s->u); free(s->z); free(s->out);
-    free(s);
+static void mingru_free(MinGRU* m) {
+    free(m->W_z); free(m->W_h);
+    free(m->state);
+    free(m->k); free(m->v); free(m->out);
+    free(m);
 }
 
 // One token step. Mirrors the GPU forward kernel exactly.
-static void ssm_forward(SSM* s, float* x) {
-    int d = s->d_model, N = s->state_dim;
+static void mingru_forward(MinGRU* m, float* x) {
+    int d = m->d_model;
 
     cblas_sgemv(CblasRowMajor, CblasTrans, d, d,
-                1.0f, s->W_in, d, x, 1, 0.0f, s->u, 1);
+                1.0f, m->W_z, d, x, 1, 0.0f, m->k, 1);
+    cblas_sgemv(CblasRowMajor, CblasTrans, d, d,
+                1.0f, m->W_h, d, x, 1, 0.0f, m->v, 1);
 
     for (int dd = 0; dd < d; dd++) {
-        float u = s->u[dd];
-        float acc = 0.0f;
-        float* st = &s->state[dd * N];
-        for (int n = 0; n < N; n++) {
-            float a_raw = s->A[dd * N + n];
-            float a = 1.0f / (1.0f + expf(-a_raw));
-            float new_s = a * st[n] + s->B[dd * N + n] * u;
-            st[n] = new_s;
-            acc += s->C[dd * N + n] * new_s;
-        }
-        s->z[dd] = acc + s->D[dd] * u;
+        float k = m->k[dd], v = m->v[dd];
+        float z = 1.0f / (1.0f + expf(-k));
+        float h_tilde = (v >= 0.0f) ? (v + 0.5f) : (1.0f / (1.0f + expf(-v)));
+        m->state[dd] = (1.0f - z) * m->state[dd] + z * h_tilde;
+        m->out[dd]   = m->state[dd];
     }
-
-    cblas_sgemv(CblasRowMajor, CblasTrans, d, d,
-                1.0f, s->W_out, d, s->z, 1, 0.0f, s->out, 1);
 }
 
-static SSM* ssm_deserialize(FILE* f) {
-    int d_model, state_dim;
-    fread(&d_model,   sizeof(int), 1, f);
-    fread(&state_dim, sizeof(int), 1, f);
-    SSM* s = ssm_alloc(d_model, state_dim);
+static MinGRU* mingru_deserialize(FILE* f) {
+    int d_model;
+    fread(&d_model, sizeof(int), 1, f);
+    MinGRU* m = mingru_alloc(d_model);
 
     size_t ws = (size_t)d_model * d_model;
-    size_t ss = (size_t)d_model * state_dim;
 
-    fread(s->W_in,  sizeof(float), ws,      f);
-    fread(s->W_out, sizeof(float), ws,      f);
-    fread(s->A,     sizeof(float), ss,      f);
-    fread(s->B,     sizeof(float), ss,      f);
-    fread(s->C,     sizeof(float), ss,      f);
-    fread(s->D,     sizeof(float), d_model, f);
+    fread(m->W_z, sizeof(float), ws, f);
+    fread(m->W_h, sizeof(float), ws, f);
 
-    // Skip optimizer state: t + (m,v) for each of {W_in,W_out,A,B,C,D}
+    // Skip optimizer state: t + (m,v) for each of {W_z, W_h}
     int t; fread(&t, sizeof(int), 1, f);
-    long skip = (long)((2 * ws + 2 * ws + 2 * ss + 2 * ss + 2 * ss + 2 * (size_t)d_model) * sizeof(float));
-    fseek(f, skip, SEEK_CUR);
-    return s;
+    fseek(f, (long)(4 * ws * sizeof(float)), SEEK_CUR);
+    return m;
 }
 
 // ============================================================================
@@ -182,7 +160,7 @@ static void rmsnorm(float* out, const float* in, int d) {
 static Transformer* transformer_alloc(int d_model, int num_layers) {
     Transformer* t = malloc(sizeof(Transformer));
     t->d_model = d_model; t->num_layers = num_layers;
-    t->ssm   = malloc(num_layers * sizeof(SSM*));
+    t->mixer = malloc(num_layers * sizeof(MinGRU*));
     t->mlp   = malloc(num_layers * sizeof(MLP*));
     t->norm1 = malloc(d_model * sizeof(float));
     t->norm2 = malloc(d_model * sizeof(float));
@@ -191,10 +169,10 @@ static Transformer* transformer_alloc(int d_model, int num_layers) {
 
 static void transformer_free(Transformer* t) {
     for (int i = 0; i < t->num_layers; i++) {
-        ssm_free(t->ssm[i]);
+        mingru_free(t->mixer[i]);
         mlp_free(t->mlp[i]);
     }
-    free(t->ssm); free(t->mlp);
+    free(t->mixer); free(t->mlp);
     free(t->norm1); free(t->norm2);
     free(t);
 }
@@ -203,8 +181,8 @@ static void transformer_forward(Transformer* t, float* x) {
     int d = t->d_model;
     for (int l = 0; l < t->num_layers; l++) {
         rmsnorm(t->norm1, x, d);
-        ssm_forward(t->ssm[l], t->norm1);
-        for (int i = 0; i < d; i++) x[i] += t->ssm[l]->out[i];
+        mingru_forward(t->mixer[l], t->norm1);
+        for (int i = 0; i < d; i++) x[i] += t->mixer[l]->out[i];
 
         rmsnorm(t->norm2, x, d);
         mlp_forward(t->mlp[l], t->norm2);
@@ -220,8 +198,8 @@ static Transformer* transformer_deserialize(FILE* f) {
     (void)hidden_dim;
     Transformer* t = transformer_alloc(d_model, num_layers);
     for (int i = 0; i < num_layers; i++) {
-        t->ssm[i] = ssm_deserialize(f);
-        t->mlp[i] = mlp_deserialize(f);
+        t->mixer[i] = mingru_deserialize(f);
+        t->mlp[i]   = mlp_deserialize(f);
     }
     return t;
 }
@@ -270,9 +248,8 @@ static GPT* gpt_load(const char* path, int seq_len) {
     gpt->transformer = transformer_deserialize(f);
     fclose(f);
 
-    fprintf(stderr, "Loaded: d_model=%d hidden=%d layers=%d vocab=%d state_dim=%d\n",
-            d_model, hidden_dim, num_layers, vocab_size,
-            gpt->transformer->ssm[0]->state_dim);
+    fprintf(stderr, "Loaded: d_model=%d hidden=%d layers=%d vocab=%d\n",
+            d_model, hidden_dim, num_layers, vocab_size);
     return gpt;
 }
 

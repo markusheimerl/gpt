@@ -9,21 +9,16 @@
 #include <cublasLt.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
-#include "ssm/ssm.h"
+#include "mingru/mingru.h"
 #include "mlp/mlp.h"
 
-// Default state-space dimension per channel for the SSM token-mixer.
-#ifndef TRANSFORMER_SSM_STATE_DIM
-#define TRANSFORMER_SSM_STATE_DIM 16
-#endif
-
 typedef struct {
-    SSM** ssm_layers;
-    MLP** mlp_layers;
+    MinGRU** mingru_layers;
+    MLP**    mlp_layers;
 
     // RMSNorm buffers
-    half** d_norm_ssm_inputs;   // [num_layers][batch_size x seq_len x d_model]
-    half** d_norm_mlp_inputs;   // [num_layers][batch_size x seq_len x d_model]
+    half** d_norm_mixer_inputs;  // [num_layers][batch_size x seq_len x d_model]
+    half** d_norm_mlp_inputs;    // [num_layers][batch_size x seq_len x d_model]
 
     // cuBLASLt handle
     cublasLtHandle_t cublaslt_handle;
@@ -34,7 +29,6 @@ typedef struct {
     int batch_size;
     int hidden_dim;
     int num_layers;
-    int state_dim;
 } Transformer;
 
 // Function prototypes

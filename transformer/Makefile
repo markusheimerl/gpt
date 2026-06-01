@@ -6,14 +6,14 @@ ARCH ?= sm_86
 CUDAFLAGS = --cuda-gpu-arch=$(ARCH) -x cuda
 CUDALIBS = -lcudart -lcublasLt
 
-test.out: transformer.o ssm/ssm.o mlp/mlp.o test.o
-	$(CC) transformer.o ssm/ssm.o mlp/mlp.o test.o $(CUDALIBS) $(LDFLAGS) -o $@
+test.out: transformer.o mingru/mingru.o mlp/mlp.o test.o
+	$(CC) transformer.o mingru/mingru.o mlp/mlp.o test.o $(CUDALIBS) $(LDFLAGS) -o $@
 
 transformer.o: transformer.c transformer.h
 	$(CC) $(CFLAGS) $(CUDAFLAGS) -c transformer.c -o $@
 
-ssm/ssm.o:
-	$(MAKE) -C ssm ssm.o
+mingru/mingru.o:
+	$(MAKE) -C mingru mingru.o
 
 mlp/mlp.o:
 	$(MAKE) -C mlp mlp.o
@@ -26,5 +26,5 @@ run: test.out
 
 clean:
 	rm -f *.out *.o *.csv *.bin
-	$(MAKE) -C ssm/ clean
+	$(MAKE) -C mingru/ clean
 	$(MAKE) -C mlp/ clean

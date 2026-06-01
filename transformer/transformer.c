@@ -1,6 +1,6 @@
 #include "transformer.h"
 
-// Initialise the transformer (SSM token-mixer + MLP feed-forward per layer).
+// Initialise the transformer (minGRU token-mixer + MLP feed-forward per layer).
 Transformer* init_transformer(int seq_len, int d_model, int hidden_dim, int num_layers, int batch_size, cublasLtHandle_t cublaslt_handle) {
     Transformer* transformer = (Transformer*)malloc(sizeof(Transformer));
 
@@ -9,39 +9,38 @@ Transformer* init_transformer(int seq_len, int d_model, int hidden_dim, int num_
     transformer->batch_size  = batch_size;
     transformer->hidden_dim  = hidden_dim;
     transformer->num_layers  = num_layers;
-    transformer->state_dim   = TRANSFORMER_SSM_STATE_DIM;
     transformer->cublaslt_handle = cublaslt_handle;
 
     size_t norm_buffer_size = (size_t)batch_size * seq_len * d_model * sizeof(half);
-    transformer->d_norm_ssm_inputs = (half**)malloc(num_layers * sizeof(half*));
-    transformer->d_norm_mlp_inputs = (half**)malloc(num_layers * sizeof(half*));
+    transformer->d_norm_mixer_inputs = (half**)malloc(num_layers * sizeof(half*));
+    transformer->d_norm_mlp_inputs   = (half**)malloc(num_layers * sizeof(half*));
     for (int i = 0; i < num_layers; i++) {
-        CHECK_CUDA(cudaMalloc(&transformer->d_norm_ssm_inputs[i], norm_buffer_size));
-        CHECK_CUDA(cudaMalloc(&transformer->d_norm_mlp_inputs[i], norm_buffer_size));
+        CHECK_CUDA(cudaMalloc(&transformer->d_norm_mixer_inputs[i], norm_buffer_size));
+        CHECK_CUDA(cudaMalloc(&transformer->d_norm_mlp_inputs[i],   norm_buffer_size));
     }
 
-    transformer->ssm_layers = (SSM**)malloc(num_layers * sizeof(SSM*));
-    transformer->mlp_layers = (MLP**)malloc(num_layers * sizeof(MLP*));
+    transformer->mingru_layers = (MinGRU**)malloc(num_layers * sizeof(MinGRU*));
+    transformer->mlp_layers    = (MLP**)malloc(num_layers * sizeof(MLP*));
     for (int i = 0; i < num_layers; i++) {
-        transformer->ssm_layers[i] = init_ssm(seq_len, d_model, transformer->state_dim, batch_size, cublaslt_handle);
-        transformer->mlp_layers[i] = init_mlp(d_model, hidden_dim, d_model, batch_size * seq_len, cublaslt_handle);
+        transformer->mingru_layers[i] = init_mingru(seq_len, d_model, batch_size, cublaslt_handle);
+        transformer->mlp_layers[i]    = init_mlp(d_model, hidden_dim, d_model, batch_size * seq_len, cublaslt_handle);
     }
     return transformer;
 }
 
 void free_transformer(Transformer* transformer) {
     for (int i = 0; i < transformer->num_layers; i++) {
-        free_ssm(transformer->ssm_layers[i]);
+        free_mingru(transformer->mingru_layers[i]);
         free_mlp(transformer->mlp_layers[i]);
     }
-    free(transformer->ssm_layers);
+    free(transformer->mingru_layers);
     free(transformer->mlp_layers);
 
     for (int i = 0; i < transformer->num_layers; i++) {
-        cudaFree(transformer->d_norm_ssm_inputs[i]);
+        cudaFree(transformer->d_norm_mixer_inputs[i]);
         cudaFree(transformer->d_norm_mlp_inputs[i]);
     }
-    free(transformer->d_norm_ssm_inputs);
+    free(transformer->d_norm_mixer_inputs);
     free(transformer->d_norm_mlp_inputs);
 
     free(transformer);
@@ -156,28 +155,28 @@ void forward_pass_transformer(Transformer* transformer, half* d_X) {
     for (int layer = 0; layer < transformer->num_layers; layer++) {
         half* layer_input = (layer == 0) ? d_X : transformer->mlp_layers[layer-1]->d_output;
 
-        // RMSNorm → SSM → residual
+        // RMSNorm → minGRU → residual
         rmsnorm_forward_kernel<<<transformer->batch_size * transformer->seq_len, 256, 8 * sizeof(float)>>>(
-            transformer->d_norm_ssm_inputs[layer],
+            transformer->d_norm_mixer_inputs[layer],
             layer_input,
             transformer->batch_size, transformer->seq_len, transformer->d_model);
 
-        forward_pass_ssm(transformer->ssm_layers[layer], transformer->d_norm_ssm_inputs[layer]);
+        forward_pass_mingru(transformer->mingru_layers[layer], transformer->d_norm_mixer_inputs[layer]);
 
         residual_add_kernel<<<blocks, 256>>>(
-            transformer->ssm_layers[layer]->d_output, layer_input, total);
+            transformer->mingru_layers[layer]->d_output, layer_input, total);
 
         // RMSNorm → MLP → residual
         rmsnorm_forward_kernel<<<transformer->batch_size * transformer->seq_len, 256, 8 * sizeof(float)>>>(
             transformer->d_norm_mlp_inputs[layer],
-            transformer->ssm_layers[layer]->d_output,
+            transformer->mingru_layers[layer]->d_output,
             transformer->batch_size, transformer->seq_len, transformer->d_model);
 
         forward_pass_mlp(transformer->mlp_layers[layer], transformer->d_norm_mlp_inputs[layer]);
 
         residual_add_kernel<<<blocks, 256>>>(
             transformer->mlp_layers[layer]->d_output,
-            transformer->ssm_layers[layer]->d_output,
+            transformer->mingru_layers[layer]->d_output,
             total);
     }
 }
@@ -188,7 +187,7 @@ float calculate_loss_transformer(Transformer* transformer, half* d_y) {
 
 void zero_gradients_transformer(Transformer* transformer) {
     for (int i = 0; i < transformer->num_layers; i++) {
-        zero_gradients_ssm(transformer->ssm_layers[i]);
+        zero_gradients_mingru(transformer->mingru_layers[i]);
         zero_gradients_mlp(transformer->mlp_layers[i]);
     }
 }
@@ -207,35 +206,35 @@ void backward_pass_transformer(Transformer* transformer, half* d_X, half* d_grad
             transformer->d_norm_mlp_inputs[layer],
             transformer->d_norm_mlp_inputs[layer]);
 
-        // Back through pre-MLP RMSNorm → grad w.r.t. (ssm_out + residual)
+        // Back through pre-MLP RMSNorm → grad w.r.t. (mixer_out + residual)
         rmsnorm_backward_kernel<<<transformer->batch_size * transformer->seq_len, 256, 16 * sizeof(float)>>>(
-            transformer->ssm_layers[layer]->d_grad_output,
+            transformer->mingru_layers[layer]->d_grad_output,
             transformer->d_norm_mlp_inputs[layer],
-            transformer->ssm_layers[layer]->d_output,
+            transformer->mingru_layers[layer]->d_output,
             transformer->batch_size, transformer->seq_len, transformer->d_model);
 
         // Residual: grad flows through both branches; add MLP-direct grad
         residual_add_kernel<<<blocks, 256>>>(
-            transformer->ssm_layers[layer]->d_grad_output,
+            transformer->mingru_layers[layer]->d_grad_output,
             transformer->mlp_layers[layer]->d_grad_output,
             total);
 
-        // Back through SSM (writes grad w.r.t. norm_ssm_inputs)
-        backward_pass_ssm(
-            transformer->ssm_layers[layer],
-            transformer->d_norm_ssm_inputs[layer],
-            transformer->d_norm_ssm_inputs[layer]);
+        // Back through minGRU (writes grad w.r.t. norm_mixer_inputs)
+        backward_pass_mingru(
+            transformer->mingru_layers[layer],
+            transformer->d_norm_mixer_inputs[layer],
+            transformer->d_norm_mixer_inputs[layer]);
 
         if (layer_grad_input != NULL) {
             rmsnorm_backward_kernel<<<transformer->batch_size * transformer->seq_len, 256, 16 * sizeof(float)>>>(
                 layer_grad_input,
-                transformer->d_norm_ssm_inputs[layer],
+                transformer->d_norm_mixer_inputs[layer],
                 layer_input,
                 transformer->batch_size, transformer->seq_len, transformer->d_model);
 
             residual_add_kernel<<<blocks, 256>>>(
                 layer_grad_input,
-                transformer->ssm_layers[layer]->d_grad_output,
+                transformer->mingru_layers[layer]->d_grad_output,
                 total);
         }
     }
@@ -243,14 +242,14 @@ void backward_pass_transformer(Transformer* transformer, half* d_X, half* d_grad
 
 void update_weights_transformer(Transformer* transformer, float learning_rate, int batch_size) {
     for (int i = 0; i < transformer->num_layers; i++) {
-        update_weights_ssm(transformer->ssm_layers[i], learning_rate, batch_size);
+        update_weights_mingru(transformer->mingru_layers[i], learning_rate, batch_size);
         update_weights_mlp(transformer->mlp_layers[i], learning_rate, batch_size);
     }
 }
 
 void reset_optimizer_transformer(Transformer* transformer) {
     for (int i = 0; i < transformer->num_layers; i++) {
-        reset_optimizer_ssm(transformer->ssm_layers[i]);
+        reset_optimizer_mingru(transformer->mingru_layers[i]);
         reset_optimizer_mlp(transformer->mlp_layers[i]);
     }
 }
@@ -260,7 +259,7 @@ void serialize_transformer(Transformer* transformer, FILE* file) {
     fwrite(&transformer->hidden_dim, sizeof(int), 1, file);
     fwrite(&transformer->num_layers, sizeof(int), 1, file);
     for (int i = 0; i < transformer->num_layers; i++) {
-        serialize_ssm(transformer->ssm_layers[i], file);
+        serialize_mingru(transformer->mingru_layers[i], file);
         serialize_mlp(transformer->mlp_layers[i], file);
     }
 }
@@ -274,10 +273,10 @@ Transformer* deserialize_transformer(FILE* file, int batch_size, int seq_len, cu
     Transformer* transformer = init_transformer(seq_len, d_model, hidden_dim, num_layers, batch_size, cublaslt_handle);
 
     for (int i = 0; i < num_layers; i++) {
-        free_ssm(transformer->ssm_layers[i]);
+        free_mingru(transformer->mingru_layers[i]);
         free_mlp(transformer->mlp_layers[i]);
-        transformer->ssm_layers[i] = deserialize_ssm(file, batch_size, seq_len, cublaslt_handle);
-        transformer->mlp_layers[i] = deserialize_mlp(file, batch_size * seq_len, cublaslt_handle);
+        transformer->mingru_layers[i] = deserialize_mingru(file, batch_size, seq_len, cublaslt_handle);
+        transformer->mlp_layers[i]    = deserialize_mlp(file, batch_size * seq_len, cublaslt_handle);
     }
     return transformer;
 }
