@@ -124,7 +124,7 @@ static void mingru_forward(MinGRU* m, float* x) {
     for (int dd = 0; dd < d; dd++) {
         float k = m->k[dd], v = m->v[dd];
         float z = 1.0f / (1.0f + expf(-k));
-        float h_tilde = (v >= 0.0f) ? (v + 0.5f) : (1.0f / (1.0f + expf(-v)));
+        float h_tilde = tanhf(v);
         m->state[dd] = (1.0f - z) * m->state[dd] + z * h_tilde;
         m->out[dd]   = m->state[dd];
     }
