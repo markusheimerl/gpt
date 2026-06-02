@@ -108,10 +108,10 @@ void free_mingru(MinGRU* m) {
     free(m);
 }
 
-// Candidate-state activation: tanh, bounded in [-1, 1].
-// Derivative: 1 - tanh(v)^2.
+// Numerically-stable activation that keeps h̃ > 0 (Feng et al., Algo 6):
+// g(v) = v + 0.5 if v >= 0, else σ(v).  Derivative: 1 if v >= 0, else σ(v)(1-σ(v)).
 __device__ static inline float mingru_g(float v) {
-    return tanhf(v);
+    return (v >= 0.0f) ? (v + 0.5f) : (1.0f / (1.0f + expf(-v)));
 }
 
 // Per-channel forward scan: h_t = (1-z_t) h_{t-1} + z_t h̃_t.
@@ -166,8 +166,8 @@ __global__ static void mingru_backward_kernel(half* __restrict__ dK,
         float dh_tilde = z * dh;
 
         float dk = dz * z * (1.0f - z);
-        // g'(v) = 1 - tanh(v)^2; h_tilde == tanh(v).
-        float dv = dh_tilde * (1.0f - h_tilde * h_tilde);
+        // g'(v) = 1 if v >= 0 else σ(v)(1-σ(v)); when v<0 h_tilde == σ(v).
+        float dv = dh_tilde * ((v >= 0.0f) ? 1.0f : h_tilde * (1.0f - h_tilde));
 
         dK[flat] = __float2half(dk);
         dV[flat] = __float2half(dv);
