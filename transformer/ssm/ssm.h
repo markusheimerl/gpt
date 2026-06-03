@@ -33,79 +33,69 @@
 } while(0)
 #endif
 
+// State-space token mixer (single layer, swish dropped → S_t = H_t):
+//   H_t = X_t B^T + H_{t-1} A^T
+//   Y_t = H_t C^T + X_t D^T
+// A: [state_dim x state_dim]   B: [state_dim x d_model]
+// C: [d_model   x state_dim]   D: [d_model   x d_model]
 typedef struct {
-    // Weights and gradients
-    half* d_W_in;       // [d_model x d_model]
-    half* d_W_out;      // [d_model x d_model]
-    half* d_A_raw;      // [d_model x state_dim]   (σ applied at use)
-    half* d_B;          // [d_model x state_dim]
-    half* d_C;          // [d_model x state_dim]
-    half* d_D;          // [d_model]
-    half* d_W_in_grad;  // [d_model x d_model]
-    half* d_W_out_grad; // [d_model x d_model]
-    half* d_A_raw_grad; // [d_model x state_dim]
-    half* d_B_grad;     // [d_model x state_dim]
-    half* d_C_grad;     // [d_model x state_dim]
-    half* d_D_grad;     // [d_model]
+    // Weights and gradients (fp16 storage, fp32 Adam moments)
+    half* d_A;        half* d_A_grad;
+    half* d_B;        half* d_B_grad;
+    half* d_C;        half* d_C_grad;
+    half* d_D;        half* d_D_grad;
 
-    // Adam parameters
-    float* d_W_in_m;    // First moment for W_in
-    float* d_W_in_v;    // Second moment for W_in
-    float* d_W_out_m;   // First moment for W_out
-    float* d_W_out_v;   // Second moment for W_out
-    float* d_A_raw_m;   // First moment for A_raw
-    float* d_A_raw_v;   // Second moment for A_raw
-    float* d_B_m;       // First moment for B
-    float* d_B_v;       // Second moment for B
-    float* d_C_m;       // First moment for C
-    float* d_C_v;       // Second moment for C
-    float* d_D_m;       // First moment for D
-    float* d_D_v;       // Second moment for D
-    float beta1;        // Exponential decay rate for first moment
-    float beta2;        // Exponential decay rate for second moment
-    float epsilon;      // Small constant for numerical stability
-    int t;              // Time step
-    float weight_decay; // Weight decay parameter for AdamW
+    // Adam moments (fp32)
+    float* d_A_m;  float* d_A_v;
+    float* d_B_m;  float* d_B_v;
+    float* d_C_m;  float* d_C_v;
+    float* d_D_m;  float* d_D_v;
+    float beta1;
+    float beta2;
+    float epsilon;
+    int t;
+    float weight_decay;
 
-    // Forward pass buffers
-    half* d_U;       // [batch_size x seq_len x d_model]               input projection
-    half* d_Z;       // [batch_size x seq_len x d_model]               scan output (pre W_out)
-    half* d_output;  // [batch_size x seq_len x d_model]               final output
-    half* d_states;  // [batch_size x seq_len x d_model x state_dim]   saved states
+    // Forward / backward buffers
+    half* d_H;       // [batch_size x seq_len x state_dim]  (batch-major; saved for backward)
+    half* d_output;  // [batch_size x seq_len x d_model]    layer output Y (public, batch-major)
+    half* d_grad_output;  // [batch_size x seq_len x d_model]   upstream dY (alias of d_output)
+    half* d_grad_H;       // [batch_size x seq_len x state_dim] BPTT scratch
 
-    // Backward pass buffers
-    half* d_grad_output;    // [batch_size x seq_len x d_model]
-    half* d_grad_Z;         // [batch_size x seq_len x d_model]
-    half* d_grad_U;         // [batch_size x seq_len x d_model]
+    // Loss buffer (standalone test only)
+    float* d_loss_result;
 
-    // Loss computation buffer
-    float* d_loss_result;   // [1]
-
-    // cuBLASLt handle and descriptor
+    // cuBLASLt handle / descriptors
     cublasLtHandle_t cublaslt_handle;
     cublasLtMatmulDesc_t matmul_desc;
 
-    // Matrix layouts
-    cublasLtMatrixLayout_t weight_layout;     // [d_model x d_model]
-    cublasLtMatrixLayout_t seq_flat_layout;   // [batch_size * seq_len x d_model]
+    // Matrix layouts (all row-major, fp16). Per-timestep slice layouts use ld = seq_len * <cols>
+    // so the same descriptor can address X[:, t, :] / H[:, t, :] via a base-pointer offset.
+    cublasLtMatrixLayout_t L_A;        // (state_dim, state_dim)
+    cublasLtMatrixLayout_t L_B;        // (state_dim, d_model)
+    cublasLtMatrixLayout_t L_C;        // (d_model,   state_dim)
+    cublasLtMatrixLayout_t L_D;        // (d_model,   d_model)
+    cublasLtMatrixLayout_t L_H_slice;  // (batch_size, state_dim) ld = seq_len * state_dim
+    cublasLtMatrixLayout_t L_H_flat;   // (batch_size * seq_len, state_dim)
+    cublasLtMatrixLayout_t L_X_flat;   // (batch_size * seq_len, d_model)  (also used for Y, dY, dX)
 
     // Dimensions
     int seq_len;
     int d_model;
-    int batch_size;
     int state_dim;
+    int batch_size;
 } SSM;
 
 // Function prototypes
-SSM* init_ssm(int seq_len, int d_model, int state_dim, int batch_size, cublasLtHandle_t cublaslt_handle);
-void free_ssm(SSM* ssm);
-void forward_pass_ssm(SSM* ssm, half* d_X);
+SSM*  init_ssm(int seq_len, int d_model, int state_dim, int batch_size, cublasLtHandle_t cublaslt_handle);
+void  free_ssm(SSM* ssm);
+void  forward_pass_ssm(SSM* ssm, half* d_X);
 float calculate_loss_ssm(SSM* ssm, half* d_y);
-void zero_gradients_ssm(SSM* ssm);
-void backward_pass_ssm(SSM* ssm, half* d_X, half* d_grad_X);
-void update_weights_ssm(SSM* ssm, float learning_rate, int batch_size);
-void reset_optimizer_ssm(SSM* ssm);
-void serialize_ssm(SSM* ssm, FILE* file);
-SSM* deserialize_ssm(FILE* file, int batch_size, int seq_len, cublasLtHandle_t cublaslt_handle);
+void  zero_gradients_ssm(SSM* ssm);
+void  backward_pass_ssm(SSM* ssm, half* d_X, half* d_grad_X);
+void  update_weights_ssm(SSM* ssm, float learning_rate, int batch_size);
+void  reset_optimizer_ssm(SSM* ssm);
+void  serialize_ssm(SSM* ssm, FILE* file);
+SSM*  deserialize_ssm(FILE* file, int batch_size, int seq_len, cublasLtHandle_t cublaslt_handle);
 
 #endif
