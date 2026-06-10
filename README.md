@@ -1,7 +1,7 @@
 # gpt
 A generative pretrained transformer implementation
 
-This project implements an autoregressive sequence model using a transformer architecture. The model processes sequences of bytes (8-bit tokens), learning to predict the next byte given previous context. While this implementation trains on text data, the architecture is agnostic to the content. It can model any byte stream, including, but not limited to, DNA/RNA sequences, compressed data, images, audio, video, or executable binaries.
+This project implements an autoregressive sequence model using a transformer architecture as well as a pretraining pipeline. The model processes sequences of bytes (8-bit tokens), learning to predict the next byte given previous context. While this implementation trains on text data, the architecture is agnostic to the content. It can model any byte stream, including, but not limited to, DNA/RNA sequences, compressed data, images, audio, video, or executable binaries.
 
 The architecture begins with a token embedding layer that converts each byte into a continuous vector representation.
 
@@ -37,6 +37,8 @@ Lily had an idea. She found a long stick and brought it to the bird. The bird sa
 <|endoftext|>
 Once upon a time, there was a little girl named Mia. Mia loved to study with her toys. She had a big box full of toys in her room. One day, Mia found a new toy. The toy was a small doll. The doll had a pretty dress and smiled a little.
 Mia took the doll outside to play. She studied hard and felt the dress on her f
+
+
 markus@thinkpad:~/gpt$ make infer
 Loaded: d_model=512  hidden=1024  layers=16  vocab=256  seq_len=1024
 Generating 995 tokens (T=0.70, seed=1779612665)
