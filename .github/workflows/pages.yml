@@ -102,10 +102,10 @@ jobs:
           </head>
           <body>
           
-          <h1>tiny-stories GPT &mdash; running in your browser</h1>
+          <h1>tiny-stories GPT - running in your browser</h1>
           <p class="sub">
             Pure-C trained GPT, INT8 quantized, inference in vanilla JS.
-            No bundler, no WASM, no committed HTML/JS &mdash; everything (including the model weights) was served from a single workflow YAML.
+            No bundler, no WASM, no committed HTML/JS - was served from a single workflow YAML.
           </p>
           
           <div class="status" id="status">initializing&hellip;</div>
