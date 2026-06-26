@@ -55,7 +55,7 @@ jobs:
           <head>
           <meta charset="utf-8">
           <meta name="viewport" content="width=device-width,initial-scale=1">
-          <title>tiny-stories GPT — in your browser, from a single YAML</title>
+          <title>tiny-stories GPT - in your browser, from a single YAML</title>
           <style>
             :root { color-scheme: dark; }
             body {
