@@ -3,7 +3,7 @@ CFLAGS = -O3 -march=native -ffast-math -Wall -Wextra
 LDFLAGS = -lopenblas -lm -flto
 
 ARCH ?= sm_86
-CUDAFLAGS = --cuda-gpu-arch=$(ARCH) -x cuda
+CUDAFLAGS = --cuda-gpu-arch=$(ARCH) -x cuda -Wno-unknown-cuda-version
 CUDALIBS = -lcudart -lcublasLt
 
 train.out: gpt.o transformer/transformer.o transformer/attention/attention.o transformer/mlp/mlp.o train.o
